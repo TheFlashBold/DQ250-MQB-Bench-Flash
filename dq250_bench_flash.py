@@ -797,7 +797,7 @@ class SbootClient:
             log.info(f"  Execute phase 2 response: {resp.hex()}")
             return True
         except TimeoutError:
-            log.info("  No response (code running or trapped)")
+            log.debug("  No response (code running or trapped)")
             return False
 
     def upload_and_execute(self, shellcode: bytes, address: int = SHELLCODE_ADDR,
@@ -865,11 +865,6 @@ def extract_block(bin_data: bytes, block_name: str) -> bytes:
         raise ValueError(f"{block_name}: expected {length} bytes, got {len(block)}")
     return block
 
-
-# ---------------------------------------------------------------------------
-# TriCore instruction encoder helpers (kept for _build_flash_manager)
-# ---------------------------------------------------------------------------
-# (SHELLCODE_REPROGRAM removed — CBOOT programming mode doesn't work on bench)
 
 # ---------------------------------------------------------------------------
 # TriCore instruction encoder helpers
@@ -944,7 +939,6 @@ def _tc_ld_w(dst_d: int, base: int, off16: int) -> bytes:
 
 def _tc_ld_w_short(dst_d: int, base: int) -> bytes:
     """LD.W d[dst], [a[base]] — 16-bit SRO, opcode 0x44 (off=0)."""
-    # SRO format: [opcode] [off4<<4 | base]  — we use off=0
     return bytes([0x44 | ((base & 0xF) << 8) >> 8,
                   (dst_d & 0xF) << 4 | (base & 0xF)])
 
@@ -995,19 +989,9 @@ def _tc_sh(dst: int, src: int, const9: int) -> bytes:
 
 
 def _tc_jz(dreg: int, disp8: int) -> bytes:
-    """JZ d[dreg], disp8 — SB format, opcode 0x76."""
-    # disp8 is in halfwords (2-byte units)
+    """JZ d[dreg], disp8 — SB format, opcode 0x76. Unused — use _tc_jeq instead."""
     return bytes([0x76, (dreg & 0xF) << 4 | ((disp8 >> 0) & 0xF),
                   (disp8 >> 4) & 0xFF])
-    # Actually SB format is: byte0=opcode, byte1=disp8[7:0] with reg in const4
-    # Wait — let me use the proper SBR format for JZ (16-bit):
-    # JZ d[a], disp4 — SBR opcode 0x6E: byte0 = 0110_1110 but that's JNZ
-    # JZ is opcode 0x76: format = [0x76] [disp8<<4 | d]... no.
-    # TriCore 16-bit JZ: opcode=0x76, format SB:
-    #   bit[7:0] = opcode (0x76)
-    #   bit[11:8] = d (register)
-    #   bit[15:12] / rest = disp8
-    # Hmm, actually let me just use 32-bit JEQ with zero.
 
 
 def _tc_jeq(d1: int, const4: int, disp15: int) -> bytes:
@@ -1035,9 +1019,7 @@ def _tc_jne(d1: int, const4: int, disp15: int) -> bytes:
 
 def _tc_j(disp24: int) -> bytes:
     """J disp24 — B format (32-bit unconditional jump), opcode 0x1D.
-    disp24 is signed displacement in halfwords.
-    Encoding: bits[7:0]=0x1D, bits[15:8]=disp24[23:16], bits[31:16]=disp24[15:0].
-    Verified against SBOOT: 0x1D000020 = J +0x2000 hw = +16384 bytes."""
+    disp24 is signed displacement in halfwords."""
     d = disp24 & 0xFFFFFF  # 24-bit two's complement
     word = ((d & 0xFFFF) << 16    # disp24[15:0] in bits[31:16]
             | ((d >> 16) & 0xFF) << 8  # disp24[23:16] in bits[15:8]
@@ -1071,9 +1053,7 @@ def _tc_mov_aa(dst: int, src: int) -> bytes:
 
 
 def _tc_add_sc(const4: int) -> bytes:
-    """ADD d15, d15, #const4 — 16-bit SRC format, opcode 0x92.
-    SRC: bits[11:8]=S1/D (dest reg), bits[15:12]=const4.
-    d[a] = d15 + const4, so a=15 for d15=d15+const4."""
+    """ADD d15, d15, #const4 — 16-bit SRC format, opcode 0x92."""
     return bytes([0x92, ((const4 & 0xF) << 4) | 0xF])
 
 
@@ -1120,7 +1100,7 @@ def _tc_addi(dst: int, src: int, const16: int) -> bytes:
 
 
 def _tc_lea_short(dst: int, base: int, off: int) -> bytes:
-    """LEA a[dst], [a[base]]off — 16-bit format if off fits, else 32-bit."""
+    """LEA a[dst], [a[base]]off — alias for _tc_lea."""
     return _tc_lea(dst, base, off)
 
 
@@ -1195,55 +1175,9 @@ FM_CMD_RESET = 0xFF
 FM_WRITE_ACK_INTERVAL = 64
 
 
-MVP_DSPR_MARKER_ADDR = 0xD000C000  # DSPR address for execution marker
-MVP_DSPR_MARKER_VAL = 0xDEADBEEF   # value to write if code executes
-
-
 def _tc_ret() -> bytes:
     """RET — return from call. Restores upper context from CSA."""
     return bytes([0x00, 0x90])
-
-
-def _build_mvp_shellcode() -> bytes:
-    """
-    Minimal test shellcode — three phases:
-
-    Phase A: Write 0xDEADBEEF to DSPR (proves data write works)
-    Phase B: Blast CAN TX on all 8 MOs (tests direct MultiCAN TX)
-    Phase C: RET — returns to sboot_execute, which sends a positive
-             response to the host. This proves:
-             - Code execution from PSPR works
-             - CAN TX works (via SBOOT's own response path)
-
-    If we see a positive response to execute phase 2 → code runs.
-    If we also see CAN frames on candump → our direct MO writes work.
-    """
-    sc = bytearray()
-
-    # --- Phase A: DSPR marker ---
-    sc += _tc_load32(0, MVP_DSPR_MARKER_VAL)
-    sc += _tc_load_addr(14, MVP_DSPR_MARKER_ADDR)
-    sc += _tc_st_w(14, 0, 0)
-
-    # --- Phase B: CAN blast on all 8 MOs ---
-    sc += _tc_load32(0, 0xDEAD0041)
-    sc += _tc_load32(1, 0xBEEFCAFE)
-    sc += _tc_load32(2, MOCTR_SETTXRQ | MOCTR_SETNEWDAT | MOCTR_SETMSGVAL)
-    sc += _tc_load32(3, 0x08000000)  # MOFCR: DLC=8
-    for mo in range(8):
-        mo_addr = MO_BASE + mo * MO_STRIDE
-        sc += _tc_load_addr(15, mo_addr)
-        sc += _tc_st_w(15, 0, 3)          # MOFCR = DLC=8
-        sc += _tc_st_w(15, MO_MODATAL, 0)
-        sc += _tc_st_w(15, MO_MODATAH, 1)
-        sc += _tc_st_w(15, MO_MOCTR, 2)
-
-    # --- Phase C: RET to sboot_execute ---
-    # sboot_execute will send positive response (0x78) for service 0x38
-    sc += _tc_ret()
-
-    log.info(f"MVP shellcode: {len(sc)} bytes")
-    return bytes(sc)
 
 
 def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
@@ -1392,43 +1326,23 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     # d6 = d5 & d4 (mask to ID bits)
     sc += _tc_and(6, 5, 4)
 
-    # if d6 == d2 (0x640) → a8 = a2
-    # JNE d6, d2 → skip_rx (use 32-bit compare)
-    # We need JNE reg,reg — TriCore BRR format:
-    # Actually let's use SUB + JNZ pattern instead
-    # d7 = d6 - d2; if d7==0 → match
-    # SUB d7, d6, d2 — RR opcode 0x0B func=0x08
+    # Check if MO matches 0x640 (RX): SUB + JNE pattern
     def _tc_sub(dst, s1, s2):
         word = ((dst & 0xF) << 28 | 0x08 << 20 | (s2 & 0xF) << 12 | (s1 & 0xF) << 8 | 0x0B)
         return word.to_bytes(4, "little")
 
     sc += _tc_sub(7, 6, 2)
-    # JNZ d7, +2 (skip mov.aa) — 16-bit SBR format opcode 0xEE? No.
-    # JNZ d15, disp4 = 0xEE but only for d15.
-    # Use JEQ d7, #0, +2 (halfwords) to jump to mov.aa, else skip
-    # Actually: JNE d7, #0, skip_rx → if NOT zero, skip the mov.aa
-    # disp15 is in halfwords. mov.aa is 2 bytes = 1 halfword.
-    # So skip 1+1 = jump over 1 instruction (mov.aa = 1 hw).
-    # JNE is 4 bytes itself. After JNE: mov.aa (2 bytes), then continue.
-    # disp15 = +2 halfwords (skip the mov.aa = 2 bytes = 1 hw, but disp includes self? No.)
-    # JNE disp is relative to JNE instruction start, in halfwords.
-    # JNE d7, #0, +2 → skip 2 halfwords = 4 bytes from JNE start = skip mov.aa.
-    # Wait: +2 means PC + 2*2 = PC + 4 bytes from JNE start. JNE itself is 4 bytes.
-    # So +2 means land at JNE+4 = right after JNE. That's no skip.
-    # disp15 of +3 means JNE_addr + 6 = skip 2 bytes after JNE = skip mov.aa.
-    sc += _tc_jne(7, 0, 3)  # if d7 != 0, skip +3 hw = +6 bytes (skip mov.aa)
+    sc += _tc_jne(7, 0, 3)  # if d7 != 0, skip mov.aa (+3 hw = +6 bytes)
     sc += _tc_mov_aa(8, 2)   # a8 = a2 (RX MO found)
 
-    # Check TX: d7 = d6 - d3
+    # Check if MO matches 0x641 (TX)
     sc += _tc_sub(7, 6, 3)
     sc += _tc_jne(7, 0, 3)
     sc += _tc_mov_aa(9, 2)   # a9 = a2 (TX MO found)
 
-    # a2 += MO_STRIDE (0x20)
+    # a2 += MO_STRIDE, d15 -= 1, loop if d15 != -1
     sc += _tc_lea(2, 2, MO_STRIDE)
-    # d15 -= 1 (count down)
-    sc += _tc_add_sc(-1)  # ADD d15, d15, #-1
-    # if d15 != -1, loop back (8 iterations: d15 = 7,6,...,1,0)
+    sc += _tc_add_sc(-1)
     jne_pos = len(sc)
     disp = (mo_scan_loop - jne_pos) // 2
     sc += _tc_jne(15, -1, disp & 0x7FFF)
@@ -1446,8 +1360,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_load_addr(6, 0xF0000020)    # a6 = WDT_CON0
     sc += _tc_load_addr(7, 0xF0000024)    # a7 = WDT_CON1
 
-    # --- Set BTV to our trap handler (one-time, requires ENDINIT clear) ---
-    # Password Access
+    # --- Set BTV to our trap handler (requires ENDINIT clear) ---
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFF01
     sc += _tc_ld_w(15, 6, 0)             # d15 = WDT_CON0
@@ -1470,7 +1383,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_load32(5, 0xDEADDEAD)       # patched later
     sc += _tc_rlc(0xCD, 0, 0xFE24, 5)     # MTCR BTV, d5
     sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
-    # Re-lock ENDINIT (Password Access + Modify ENDINIT=1)
+    # Re-lock ENDINIT
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)
     sc += _tc_ld_w(15, 6, 0)
@@ -1493,8 +1406,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     # ===================================================================
     main_loop = len(sc)
 
-    # --- WDT Service (from DRIVER FUN_0800056c: set ENDINIT, resets timer) ---
-    # Step 1: Password Access
+    # --- WDT Service (set ENDINIT → resets timer) ---
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFF01
     sc += _tc_ld_w(15, 6, 0)             # d15 = WDT_CON0
@@ -1505,7 +1417,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_or_rr(15, 15, 7)           # d15 |= d7
     sc += _tc_st_w(6, 0, 15)             # WDT_CON0 = password access
     sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
-    # Step 2: Modify (set ENDINIT=1, LCK=1 → services WDT)
+    # Modify: set ENDINIT=1, LCK=1
     sc += _tc_mov_u(5, 0xFFF0)
     sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFFF0
     sc += _tc_and(15, 15, 5)             # d15 &= 0xFFFFFFF0
@@ -1554,12 +1466,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     ping_handler = len(sc)
 
     # PING handler: send [0x41, 0x00, 'D', 'Q', '2', '5', '0', 0x00]
-    sc += _tc_load32(0, 0x00514441)  # bytes [3:0] = 41 00 44 51  (LE: 0x41, 0x00, 'D'=0x44, 'Q'=0x51)
-    # Wait — CAN MODATAL is bytes[3:0] in LE u32. So MODATAL[0]=byte0, etc.
-    # We want: byte0=0x41, byte1=0x00, byte2='D'=0x44, byte3='Q'=0x51
-    # As u32 LE: 0x5144_0041
-    sc = sc[:-4]  # remove wrong load
-    sc += _tc_load32(0, 0x51440041)  # MODATAL: [0x41, 0x00, 0x44, 0x51]
+    sc += _tc_load32(0, 0x51440041)  # MODATAL: [0x41, 0x00, 'D', 'Q']
     sc += _tc_load32(1, 0x00303532)  # MODATAH: ['2'=0x32, '5'=0x35, '0'=0x30, 0x00]
     # Jump to send_response
     send_resp_jmp = len(sc)
@@ -1575,114 +1482,42 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_jne(2, FM_CMD_READ, 0)  # placeholder
     read_handler = len(sc)
 
-    # READ handler: extract address from d0 bytes[1..4] and length from d0/d1
-    # d0 = MODATAL = [cmd, addr_b0, addr_b1, addr_b2]
-    # d1 = MODATAH = [addr_b3, len_b0, len_b1, 0]
-    # Address = (d12 >> 8) | ((d13 & 0xFF) << 24)
-    # But we need: addr = addr3<<24 | addr2<<16 | addr1<<8 | addr0
-    # d12 >> 8 gives [0, cmd... wait no.
-    # d12 as u32 LE bytes: [byte0=cmd, byte1=addr3, byte2=addr2, byte3=addr1]
-    # d12 >> 8 = [0, byte0, byte1, byte2] = [0, cmd, addr3, addr2] — that's wrong.
-    # Actually we want big-endian address from bytes 1-4 of the CAN frame.
-    # CAN frame byte layout: [0]=cmd, [1]=ADDR3, [2]=ADDR2, [3]=ADDR1, [4]=ADDR0, [5]=LEN1, [6]=LEN0, [7]=0
-    # MODATAL u32 LE = byte[3]<<24 | byte[2]<<16 | byte[1]<<8 | byte[0]
-    #                = ADDR1<<24 | ADDR2<<16 | ADDR3<<8 | cmd
-    # MODATAH u32 LE = byte[7]<<24 | byte[6]<<16 | byte[5]<<8 | byte[4]
-    #                = 0<<24 | LEN0<<16 | LEN1<<8 | ADDR0
-    #
-    # So address = ADDR3<<24 | ADDR2<<16 | ADDR1<<8 | ADDR0
-    #            = ((d12>>8) & 0xFF)<<24 | ((d12>>16)&0xFF)<<16 | ((d12>>24)&0xFF)<<8 | (d13&0xFF)
-    # This is byte-swapping the upper 3 bytes of d12 and prepending d13's lowest byte.
-    # Basically: address = bswap32(d12) >> 8 | (d13 & 0xFF) ... no, it's messy.
-    #
-    # Simpler approach: use a lookup/shift approach, or just extract byte by byte.
-    # Actually: address = ADDR3<<24 | ADDR2<<16 | ADDR1<<8 | ADDR0
-    # In d12 (LE): bits[15:8]=ADDR3, bits[23:16]=ADDR2, bits[31:24]=ADDR1
-    # In d13 (LE): bits[7:0]=ADDR0
-    #
-    # Let me re-think the protocol to be LE-friendly.
-    # Actually, let's just define the protocol as sending address in LE u32 at bytes[1..4]:
-    # TX: [cmd, addr_b0, addr_b1, addr_b2, addr_b3, len_b0, len_b1, 0]
-    # Then MODATAL = addr_b2<<24 | addr_b1<<16 | addr_b0<<8 | cmd
-    # MODATAH = 0<<24 | len_b1<<16 | len_b0<<8 | addr_b3
-    # Still messy. The cleanest is: address at bytes[1..4] little-endian.
+    # READ handler: extract LE address from bytes[1..4] and LE length from bytes[5..6]
     # MODATAL = [cmd, addr[7:0], addr[15:8], addr[23:16]]
     # MODATAH = [addr[31:24], len[7:0], len[15:8], 0]
-    # addr = (d12 >> 8) & 0x00FFFFFF | (d13 & 0xFF) << 24
-    # len  = (d13 >> 8) & 0xFFFF
+    # addr = (d0 >> 8) & 0x00FFFFFF | (d1 & 0xFF) << 24
+    # len  = (d1 >> 8) & 0xFFFF
 
-    # d3 = d0 >> 8 (shift right 8 bits to remove cmd byte)
-    # SH const9[5:0] = -8 as 6-bit two's complement = 0x38
-    sc += _tc_sh(3, 0, 0x1F8)  # d3 = d0 >> 8
-    # Actually SH does logical shift. const9[5:0] = -8 = 0x38. This gives d12 >> 8.
-    # d3 = 0x00 | ADDR1 | ADDR2 | ADDR3  (shifted right, top byte zeroed)
+    sc += _tc_sh(3, 0, 0x1F8)  # d3 = d0 >> 8 (remove cmd byte, lower 24 bits of addr)
 
-    # d4 = d1 & 0xFF (high byte of address from MODATAH)
+    # d4 = (d1 & 0xFF) << 24 (high byte of address)
     sc += _tc_and_imm(4, 1, 0xFF)
     # d4 = d4 << 24
     sc += _tc_sh(4, 4, 24)
 
     # d3 = d3 | d4 → address
-    sc += _tc_or_rr(3, 3, 4)
-    # d3 = address (reconstructed)
+    sc += _tc_or_rr(3, 3, 4)  # d3 = address
 
-    # d4 = (d1 >> 8) & 0xFFFF → length
+    # d4 = (d1 >> 8) & 0xFFFF = length
     sc += _tc_sh(4, 1, 0x1F8)  # d4 = d1 >> 8
-    sc += _tc_and_imm(4, 4, 0x1FF)  # only 9 bits from AND imm... need 16 bits
-    # AND with const9 can only do 9-bit immediate. Use MOV.U + AND instead.
-    sc = sc[:-4]
-    sc += _tc_mov_u(5, 0xFFFF)  # d5 = 0x0000FFFF
-    sc += _tc_and(4, 4, 5)      # d4 = d4 & 0xFFFF = length
+    sc += _tc_mov_u(5, 0xFFFF)
+    sc += _tc_and(4, 4, 5)      # d4 = length (16-bit)
 
-    # Now: d3 = address, d4 = length
-    # Convert d3 to address register for reading: a3 = d3
-    sc += _tc_mov_a_d(3, 3)  # a3 = address to read from
+    sc += _tc_mov_a_d(3, 3)  # a3 = read address
 
-    # Multi-frame read loop:
-    # Send [0x42, seq, d0, d1, d2, d3, d4, d5] — 6 data bytes per frame
-    # d14 = seq counter
-    sc += _tc_mov_d(14, 0)
+    # Multi-frame read loop: 4 bytes per frame in MODATAH
+    # Response: MODATAL = [0x42, seq, remaining_hi, remaining_lo]
+    #           MODATAH = [D0, D1, D2, D3]
+    sc += _tc_mov_d(14, 0)  # d14 = seq counter
 
     read_loop = len(sc)
-    # Check if d4 (remaining length) <= 0
     read_done_jeq = len(sc)
-    sc += _tc_jeq(4, 0, 0)  # placeholder — patch to jump to main_loop
+    sc += _tc_jeq(4, 0, 0)  # placeholder — jump to end when d4 == 0
 
-    # Read up to 6 bytes from [a3] into d0/d1
-    # For simplicity, always read 2 words (8 bytes) and send 6
     sc += _tc_ld_w(0, 3, 0)   # d0 = *(a3+0) — bytes [3:0]
     sc += _tc_ld_w(1, 3, 4)   # d1 = *(a3+4) — bytes [7:4]
 
-    # Build response MODATAL: [0x42, seq, data0, data1]
-    # We want: byte0=0x42, byte1=d14 (seq), byte2..7=data
-    # This is complex to assemble in registers. Simpler: write fields directly.
-    #
-    # Alternative approach: write raw d0/d1 to TX MODATAL/MODATAH,
-    # then overwrite byte0/byte1 using byte-store instructions.
-    # But TriCore byte stores to peripherals may not work well.
-    #
-    # Simplest: reorganize as [data0..data3] [data4, data5, seq, 0x42]
-    # Actually for the protocol, let's put response ID first:
-    # MODATAL = [0x42, seq, data[0], data[1]]
-    # MODATAH = [data[2], data[3], data[4], data[5]]
-    #
-    # data[0..3] = d0 as LE bytes, data[4..5] = d1 low 2 bytes
-    # MODATAL needs: 0x42 | (seq<<8) | (data[0]<<16) | (data[1]<<24)
-    #              = 0x42 | (d14<<8) | ((d0 & 0xFF)<<16) | (((d0>>8)&0xFF)<<24)
-    # This is getting very complex in pure TriCore asm. Let me simplify the protocol.
-    #
-    # REVISED READ PROTOCOL — raw data, minimal framing:
-    # Response: [0x42, seq, B0, B1, B2, B3, B4, B5] — 6 bytes per frame
-    # We just store the data words and then patch byte 0 and 1.
-    #
-    # Actually, even simpler: just stream 4 bytes per frame with simpler encoding:
-    # [0x42, seq, 0, 0, D0, D1, D2, D3] — data in MODATAH as a clean u32
-    # Then Python reads MODATAH directly. Much simpler in asm!
-
-    # REVISED: [0x42, seq, len_remaining_hi, len_remaining_lo] in MODATAL
-    #          [D0, D1, D2, D3] in MODATAH (4 bytes of flash data per frame)
-
-    # Build MODATAL: 0x42 | (d14 << 8) | ((d4 & 0xFFFF) << 16)
+    # Build MODATAL: 0x42 | (seq << 8) | (remaining << 16)
     sc += _tc_mov_u(5, 0x0042)      # d5 = 0x42
     sc += _tc_sh(6, 14, 8)          # d6 = seq << 8
     sc += _tc_or_rr(5, 5, 6)        # d5 |= seq<<8
@@ -1710,8 +1545,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_load32(5, MOCTR_RESTXPND)
     sc += _tc_st_w(9, MO_MOCTR, 5)
 
-    # --- Inline WDT service (prevents reset during long reads) ---
-    # Uses d5, d7, d15 as temps (free here), a6/a7 = WDT_CON0/CON1 (persistent)
+    # Inline WDT service (prevents reset during long reads)
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFF01
     sc += _tc_ld_w(15, 6, 0)             # d15 = WDT_CON0
@@ -1729,11 +1563,10 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_st_w(6, 0, 15)             # WDT_CON0 = modify (service)
     sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
 
-    # Advance: a3 += 4, d4 -= 4, d14 += 1
+    # Advance: a3 += 4, d4 -= 4, d14 (seq) += 1
     sc += _tc_lea(3, 3, 4)
-    sc += _tc_addi(4, 4, -4 & 0xFFFF)  # ADDI const16 is sign-extended
-    sc += _tc_add_sc(1)  # d15++ — wait, we're using d14 for seq, not d15
-    # ADD d14, d14, #1 — need ADDI
+    sc += _tc_addi(4, 4, -4 & 0xFFFF)
+    sc += _tc_add_sc(1)  # d15 (unused side effect)
     sc += _tc_addi(14, 14, 1)
 
     # Check if d4 > 0, loop back
@@ -1761,21 +1594,14 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     erase_jne_pos = len(sc)
     sc += _tc_jne(2, FM_CMD_ERASE, 0)  # placeholder
 
-    # ERASE handler: extract address and length, call DRIVER_ERASE
-    # TX: [03, addr_b0..b3, len_b0..b2] — 8 bytes
-    # addr = (d0>>8)&0xFFFFFF | ((d1&0xFF)<<24)  (LE in CAN frame)
-    # len  = (d1>>8)&0xFFFFFF
-
-    # Extract address → d3, length → d4
+    # ERASE handler: extract LE address → d3, LE length → d4, call DRIVER_ERASE
     sc += _tc_sh(3, 0, 0x1F8)  # d3 = d0 >> 8 (lower 24 bits of addr)
     sc += _tc_and_imm(4, 1, 0xFF)
     sc += _tc_sh(4, 4, 24)
     sc += _tc_or_rr(3, 3, 4)  # d3 = address
     sc += _tc_sh(4, 1, 0x1F8)  # d4 = d1 >> 8 = length (24-bit)
 
-    # Fill param struct (a10 = param base):
-    #   +0x00 = 0, +0x04 = status(0), +0x08 = addr, +0x0C = len,
-    #   +0x10 = 0, +0x14 = WDT callback, +0x18..+0x20 = 0
+    # Fill param struct for DRIVER_ERASE
     sc += _tc_mov_d(5, 0)
     sc += _tc_st_w(10, 0x00, 5)           # +0x00 = 0
     sc += _tc_st_w(10, 0x04, 5)           # +0x04 = status = 0
@@ -1787,28 +1613,23 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_mov_d(5, 0)
     sc += _tc_st_w(10, 0x20, 5)           # +0x20 = write_pos = 0
 
-    # Save a8/a9 to upper-ctx d-regs (preserved across CALL/RET)
-    # a8 (RX MO) and a9 (TX MO) are NOT in any context — DRIVER may clobber
-    sc += _tc_mov_d_a(14, 8)              # d14 = a8 (saved to CSA by CALL)
-    sc += _tc_mov_d_a(15, 9)              # d15 = a9 (saved to CSA by CALL)
-
-    # Save param_base (a10) and set a10 = valid stack pointer
-    # a10 is upper ctx — CALL saves it. But callee uses a10 as SP!
-    sc += _tc_mov_d_a(11, 10)             # d11 = param_base (saved to CSA)
+    # Save a8/a9/a10 to d-regs (preserved across CALL via CSA)
+    sc += _tc_mov_d_a(14, 8)              # d14 = a8
+    sc += _tc_mov_d_a(15, 9)              # d15 = a9
+    sc += _tc_mov_d_a(11, 10)             # d11 = param_base
     sc += _tc_load_addr(10, 0xD000E000)   # a10 = SP (DSPR stack)
 
     # a4 = param struct pointer (DRIVER's first argument)
     sc += _tc_mov_a_d(4, 11)              # a4 = param_base (from d11)
 
     # CALL DRIVER_ERASE (PC-relative disp24)
-    # DRIVER init (called internally) handles ENDINIT/BTV/flash-register setup
     call_erase_pos = len(sc)
     call_erase_target = DRIVER_ERASE  # absolute address
     call_erase_pc = sc_base + call_erase_pos
     call_erase_disp = (call_erase_target - call_erase_pc) // 2
     sc += _tc_call(call_erase_disp)
 
-    # After RET: d11=param_base, d14=a8, d15=a9 (restored from CSA)
+    # Restore a-regs from CSA-saved d-regs
     sc += _tc_mov_a_d(10, 11)             # a10 = param_base
     sc += _tc_mov_a_d(8, 14)              # a8 = RX MO base
     sc += _tc_mov_a_d(9, 15)              # a9 = TX MO base
@@ -1846,12 +1667,9 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_mov_u(5, 0xFFFF)
     sc += _tc_and(4, 4, 5)     # d4 = length (16-bit)
 
-    # Store in persistent registers
+    # Store in persistent d-registers (d9=addr, d10=len, d8=buf offset)
     sc += _tc_mov_d_d(9, 3)   # d9 = target address
-    sc += _tc_mov_d_d(10, 4)  # d10 = total length — wait, d10 conflicts with a10!
-    # d-registers and a-registers are separate register files in TriCore.
-    # d10 is fine, a10 is the param struct pointer — no conflict.
-    sc += _tc_mov_d_d(10, 4)
+    sc += _tc_mov_d_d(10, 4)  # d10 = total length
     sc += _tc_mov_d(8, 0)     # d8 = buffer offset = 0
 
     # Send ACK: [0x44, 0x00, ...]
@@ -1868,37 +1686,11 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     wd_jne_pos = len(sc)
     sc += _tc_jne(2, FM_CMD_WRITE_DATA, 0)
 
-    # WRITE_DATA: [05, seq, D0, D1, D2, D3, D4, 0]
-    # MODATAL = [05, seq, D0, D1]  → d12
-    # MODATAH = [D2, D3, D4, 0]   → d13
-    # Data bytes: D0..D4 = 5 bytes per frame (bytes 2-6 of CAN frame)
-    # Actually 7 bytes: D0..D6 in bytes[2..7], but byte[7] may be pad.
-    # Let's do 6 bytes: D0..D5 in bytes[2..7].
-    # MODATAL >> 16 gives [D0, D1] in low 16 bits.
-    # MODATAH & 0xFFFFFFFF gives [D2, D3, D4, pad].
-    #
-    # For simplicity, store 4 bytes from each CAN frame:
-    # bytes[2..5] = MODATAL>>16 (2 bytes) | MODATAH&0xFFFF (2 bytes)
-    # That's only 4 bytes. Let's do 7 bytes per frame as planned:
-    # bytes[1..7] = all 7 data bytes after cmd.
-    # MODATAL>>8 gives bytes[1..3] (seq, D0, D1) in 24 bits
-    # Actually let's just write full words to buffer and sort it out.
-    #
-    # Simplest approach: store d12>>16 (2 bytes) and d13 (4 bytes) = 6 bytes total
-    # Then Python sends data packed as: [05, seq, D0, D1, D2, D3, D4, D5]
+    # WRITE_DATA: 4 bytes per frame from MODATAH
+    # Frame: [05, seq, 0, 0, D0, D1, D2, D3]
+    # Store MODATAH (d1) to buffer at offset d8, advance by 4
 
-    # Copy 6 data bytes (bytes[2..7]) to buffer at a12+d8:
-    # Word 1 (bytes 2,3 from MODATAL high half): d3 = d12 >> 16 (only 16 bits of data)
-    # Word 2 (bytes 4..7 = MODATAH): d13 (4 bytes)
-    # Total per frame: 6 bytes. But misaligned stores are tricky.
-    #
-    # Even simpler: 4 bytes per frame from MODATAH only.
-    # [05, seq, 0, 0, D0, D1, D2, D3] — Python packs 4 data bytes in MODATAH.
-    # Then we just: *(buffer + d8) = d13; d8 += 4
-    # This wastes CAN bandwidth but is trivially simple.
-
-    # a3 = buffer_base + d8 (buffer + offset)
-    # Avoid ADDSC.A (encoding issues) — use load + add + mov.a instead
+    # a3 = buffer_base + d8
     sc += _tc_load32(5, FM_BUFFER)   # d5 = buffer base address
     sc += _tc_add(5, 5, 8)           # d5 = buffer_base + d8
     sc += _tc_mov_a_d(3, 5)          # a3 = d5
@@ -1909,14 +1701,11 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     # d8 += 4
     sc += _tc_addi(8, 8, 4)
 
-    # Check if we need to ACK (every FM_WRITE_ACK_INTERVAL frames)
-    # seq from MODATAL byte[1]: d3 = (d0 >> 8) & 0xFF
-    sc += _tc_sh(3, 0, 0x1F8)  # d3 = d0 >> 8 (seq from MODATAL)
-    sc += _tc_and_imm(3, 3, 0xFF)  # d3 = seq
-    # Check (seq + 1) & (ACK_INTERVAL-1) == 0 (every 64th frame: seq=63,127,191,255)
-    # This avoids const4 overflow: 63 doesn't fit in 4-bit, but 0 does.
-    sc += _tc_addi(5, 3, 1)  # d5 = seq + 1
-    sc += _tc_and_imm(5, 5, FM_WRITE_ACK_INTERVAL - 1)  # d5 = (seq+1) & 63
+    # ACK every FM_WRITE_ACK_INTERVAL frames: check (seq+1) & (interval-1) == 0
+    sc += _tc_sh(3, 0, 0x1F8)             # d3 = d0 >> 8 (seq byte)
+    sc += _tc_and_imm(3, 3, 0xFF)          # d3 = seq
+    sc += _tc_addi(5, 3, 1)               # d5 = seq + 1
+    sc += _tc_and_imm(5, 5, FM_WRITE_ACK_INTERVAL - 1)
     wd_no_ack_pos = len(sc)
     sc += _tc_jne(5, 0, 0)  # placeholder → skip ACK (if NOT 0, skip)
 
@@ -1942,18 +1731,12 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     wd_no_ack_skip = (wd_after_ack - wd_no_ack_pos) // 2
     sc[wd_no_ack_pos:wd_no_ack_pos + 4] = _tc_jne(5, 0, wd_no_ack_skip)
 
-    # Check if all data received: d8 >= d10
-    # SUB d5, d8, d10; if d5 >= 0 (unsigned: d8 >= d10) → trigger write
-    # Actually just check d8 == d10 (exact match expected)
-    sc += _tc_sub(5, 10, 8)  # d5 = d10 - d8; if 0, all received
+    # Check if all data received: d10 - d8 == 0
+    sc += _tc_sub(5, 10, 8)
     wd_not_done_pos = len(sc)
     sc += _tc_jne(5, 0, 0)  # placeholder → main_loop
 
-    # All data received — call DRIVER 0x334 (PROGRAM+VERIFY)
-    # DRIVER 0x334 writes data from buffer to flash AND verifies read-back.
-    # Param struct: +0x08=target addr, +0x0C=length, +0x10=source data ptr,
-    #               +0x14=WDT callback
-
+    # All data received — call DRIVER PROGVER (program + verify)
     # Fill param struct
     sc += _tc_mov_d(5, 0)
     sc += _tc_st_w(10, 0x00, 5)           # +0x00 = 0
@@ -2071,26 +1854,13 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     fr_skip = (fr_end - fr_jne_pos) // 2
     sc[fr_jne_pos:fr_jne_pos + 4] = _tc_jne(2, FM_CMD_FLASH_RESET, fr_skip)
 
-    # --- Check RESET (0xFF) ---
-    # d2 still has cmd byte. 0xFF doesn't fit in JNE const4 (only 4 bits = 0..15).
-    # Use full compare: d5 = d2 - 0xFF; JNE d5, 0, skip
+    # --- Check RESET (0xFF) — doesn't fit in const4, use ADDI + JNE ---
     sc += _tc_addi(5, 2, -0xFF & 0xFFFF)
     reset_jne_pos = len(sc)
     sc += _tc_jne(5, 0, 0)
 
-    # RESET: Write DSPR warm boot magic for CBOOT, then Application Reset.
-    #
-    # CBOOT's cboot_check_asw_valid checks:
-    #   d000dffc == 0x5353015B  (warm boot magic 1)
-    #   d000dff8 == 0xACACFEA4  (complement)
-    #   d000dff4 == 0x25A5A5A2  (programming complete → clears NVM error flags)
-    #
-    # The 0x25A5A5A2 path validates CRC, clears sticky NVM error bits (1-3,5-6),
-    # writes NVM, then falls through to cold boot validate which succeeds
-    # because fingerprints match and flags are now clean.
-    # This makes the fix PERMANENT — survives power cycles.
-
-    # Write warm boot magic to DSPR
+    # RESET: Write CBOOT warm boot magic to DSPR, then Application Reset.
+    # 0x25A5A5A2 = programming complete (clears NVM error flags on boot)
     sc += _tc_load_addr(2, 0xD000DFF4)
     sc += _tc_load32(0, 0x25A5A5A2)         # programming complete magic
     sc += _tc_st_w(2, 0, 0)                 # *(d000dff4) = 0x25A5A5A2
@@ -2100,7 +1870,6 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_st_w(2, 8, 0)                 # *(d000dffc) = 0x5353015B
 
     # Disable ENDINIT (required for SCU_RSTCON write)
-    # Password Access: WDT_CON0 = (WDT_CON0 & 0xFFFFFF01) | 0xF0 | (WDT_CON1 & 0xC)
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)           # d5 = 0xFFFFFF01
     sc += _tc_ld_w(15, 6, 0)               # d15 = WDT_CON0
@@ -2208,9 +1977,9 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
         pad = 0x20 - (len(sc) - slot_start)
         sc += bytes(pad)
 
-    log.info(f"Trap table at offset 0x{trap_table_offset:X} "
-             f"(addr 0x{TRAP_TABLE_ADDR:X}), "
-             f"common handler at 0x{COMMON_HANDLER_ADDR:X}")
+    log.debug(f"Trap table at offset 0x{trap_table_offset:X} "
+              f"(addr 0x{TRAP_TABLE_ADDR:X}), "
+              f"common handler at 0x{COMMON_HANDLER_ADDR:X}")
 
     # Patch BTV placeholder with actual TRAP_TABLE_ADDR
     sc[btv_load_pos:btv_load_pos + 8] = _tc_load32(5, TRAP_TABLE_ADDR)
@@ -2236,7 +2005,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     _patch_j32(wd_not_done_main, main_loop)
     _patch_j32(unknown_j, main_loop)
 
-    log.info(f"Flash Manager shellcode: {len(sc)} bytes")
+    log.debug(f"Flash Manager shellcode: {len(sc)} bytes")
     return bytes(sc)
 
 
@@ -2318,7 +2087,7 @@ class FlashManagerClient:
         resp = self._send_cmd(cmd[:8])
         if resp[0] != 0x44:
             raise RuntimeError(f"WRITE_START: unexpected response {resp.hex()}")
-        log.info(f"WRITE_START 0x{address:08x} len={length}")
+        log.debug(f"WRITE_START 0x{address:08x} len={length}")
 
     def write_data(self, data: bytes):
         """
@@ -2352,7 +2121,7 @@ class FlashManagerClient:
                 # Check if done flag set (byte2 = 0x01)
                 if resp[2] == 0x01:
                     status = resp[1]
-                    log.info(f"WRITE complete: status={status}")
+                    log.debug(f"WRITE complete: status={status}")
                     return status
 
             seq += 1
@@ -2362,7 +2131,7 @@ class FlashManagerClient:
         if resp is None:
             raise TimeoutError("WRITE_DATA: no final ACK")
         status = resp[1]
-        log.info(f"WRITE complete: status={status}")
+        log.debug(f"WRITE complete: status={status}")
         return status
 
     def verify(self, address: int, length: int) -> int:
@@ -2399,7 +2168,6 @@ def run_flash_direct(
     relay_gpio: int | None = None,
     power_off_time: float = 2.0,
     ping_only: bool = False,
-    mvp: bool = False,
     read_addr: int | None = None,
     read_len: int = 256,
     skip_erase: bool = False,
@@ -2419,113 +2187,15 @@ def run_flash_direct(
         log.warning(f"Binary size 0x{len(bin_data):x} != expected 0x180000")
 
     # Verify JAMCRC before flashing (SBOOT checks this on every boot)
-    if not mvp:
-        for bname in ["ASW", "CAL"]:
-            valid, stored, calc = verify_block_jamcrc(bin_data, bname)
-            if valid:
-                log.info(f"  {bname} JAMCRC: 0x{stored:08X} OK")
-            else:
-                log.error(f"  {bname} JAMCRC: stored=0x{stored:08X}, calc=0x{calc:08X} MISMATCH!")
-                raise ValueError(f"{bname} JAMCRC invalid — SBOOT will reject. Fix JAMCRC in bin file first.")
+    for bname in ["ASW", "CAL"]:
+        valid, stored, calc = verify_block_jamcrc(bin_data, bname)
+        if valid:
+            log.info(f"  {bname} JAMCRC: 0x{stored:08X} OK")
+        else:
+            log.error(f"  {bname} JAMCRC: stored=0x{stored:08X}, calc=0x{calc:08X} MISMATCH!")
+            raise ValueError(f"{bname} JAMCRC invalid — SBOOT will reject. Fix JAMCRC in bin file first.")
 
-    if mvp == "fm-blast":
-        # Test: exact FM debug blast (MO1 only) + RET
-        sc = bytearray()
-        sc += _tc_load32(0, 0x00000042)
-        sc += _tc_load32(1, 0x00000900)
-        sc += _tc_load32(2, MOCTR_SETTXRQ | MOCTR_SETNEWDAT | MOCTR_SETMSGVAL)
-        sc += _tc_load32(3, 0x08000000)
-        sc += _tc_load_addr(15, MO_BASE + MO_STRIDE)
-        sc += _tc_st_w(15, 0, 3)
-        sc += _tc_st_w(15, MO_MODATAL, 0)
-        sc += _tc_st_w(15, MO_MODATAH, 1)
-        sc += _tc_st_w(15, MO_MOCTR, 2)
-        sc += _tc_ret()
-        payload = bytes(sc)
-        log.info(f"FM-blast test: {len(payload)} bytes")
-    elif mvp == "fm-mini":
-        # Minimal FM: hardcoded MOs, PING-only loop, no discovery
-        # a8 = RX MO (MO0), a9 = TX MO (MO1) — hardcoded from SBOOT config
-        sc = bytearray()
-
-        # --- Debug blast (prove entry) ---
-        sc += _tc_load32(0, 0x00000042)
-        sc += _tc_load32(1, 0x00004D49)  # "MI" = mini
-        sc += _tc_load32(2, MOCTR_SETTXRQ | MOCTR_SETNEWDAT | MOCTR_SETMSGVAL)
-        sc += _tc_load32(3, 0x08000000)
-        sc += _tc_load_addr(15, MO_BASE + MO_STRIDE)  # MO1 = TX
-        sc += _tc_st_w(15, 0, 3)        # MOFCR = DLC=8
-        sc += _tc_st_w(15, MO_MODATAL, 0)
-        sc += _tc_st_w(15, MO_MODATAH, 1)
-        sc += _tc_st_w(15, MO_MOCTR, 2)
-
-        # --- Hardcode a8 = MO0 (RX, 0x640), a9 = MO1 (TX, 0x641) ---
-        sc += _tc_load_addr(8, MO_BASE)               # a8 = MO0
-        sc += _tc_load_addr(9, MO_BASE + MO_STRIDE)   # a9 = MO1
-
-        # Enable RX on MO0: SETRXEN | SETMSGVAL | RESNEWDAT
-        sc += _tc_load32(0, MOCTR_SETRXEN | MOCTR_SETMSGVAL | MOCTR_RESNEWDAT)
-        sc += _tc_st_w(8, MO_MOCTR, 0)
-
-        # Set DLC=8 on TX MO
-        sc += _tc_load32(0, 0x08000000)
-        sc += _tc_st_w(9, 0, 0)
-
-        # --- Main loop: poll RX, respond to PING ---
-        main_loop = len(sc)
-        # Read MOSTAT
-        sc += _tc_ld_w(0, 8, MO_MOSTAT)
-        # Check NEWDAT (bit 3)
-        sc += _tc_and_imm(1, 0, MOSTAT_NEWDAT)
-        # If no new data, loop back
-        jz_pos = len(sc)
-        disp = (main_loop - jz_pos) // 2
-        sc += _tc_jeq(1, 0, disp & 0x7FFF)
-
-        # Got data — read it
-        sc += _tc_ld_w(0, 8, MO_MODATAL)   # d0 = bytes[3:0]
-
-        # Clear NEWDAT + RXPND, re-enable RX
-        sc += _tc_load32(2, MOCTR_RESNEWDAT | MOCTR_RESRXPND)
-        sc += _tc_st_w(8, MO_MOCTR, 2)
-        sc += _tc_load32(2, MOCTR_SETRXEN | MOCTR_SETMSGVAL)
-        sc += _tc_st_w(8, MO_MOCTR, 2)
-
-        # Always respond with PING reply regardless of command
-        # MODATAL = [0x41, 0x00, 'O', 'K'] = 0x4B4F0041
-        sc += _tc_load32(0, 0x4B4F0041)
-        sc += _tc_load32(1, 0x00000000)
-        sc += _tc_st_w(9, MO_MODATAL, 0)
-        sc += _tc_st_w(9, MO_MODATAH, 1)
-        sc += _tc_load32(2, MOCTR_SETTXRQ | MOCTR_SETNEWDAT)
-        sc += _tc_st_w(9, MO_MOCTR, 2)
-
-        # Poll TXPND
-        tx_poll = len(sc)
-        sc += _tc_ld_w(5, 9, MO_MOSTAT)
-        sc += _tc_and_imm(6, 5, MOSTAT_TXPND)
-        tx_jz = len(sc)
-        disp = (tx_poll - tx_jz) // 2
-        sc += _tc_jeq(6, 0, disp & 0x7FFF)
-
-        # Clear TXPND
-        sc += _tc_load32(5, MOCTR_RESTXPND)
-        sc += _tc_st_w(9, MO_MOCTR, 5)
-
-        # Loop back to main
-        j_main = len(sc)
-        disp = (main_loop - j_main) // 2
-        sc += _tc_j(disp)
-
-        payload = bytes(sc)
-        log.info(f"FM-mini test: {len(payload)} bytes")
-    elif mvp:
-        # MVP test: minimal shellcode to verify code execution
-        # Blasts a CAN frame on every MO — run `candump can0` to see it
-        payload = _build_mvp_shellcode()
-        log.info(f"MVP payload: {len(payload)} bytes (straight to 0xD4000000)")
-    else:
-        # Extract DRIVER block
+    # Extract DRIVER block
         driver_data = extract_block(bin_data, "DRIVER")
         log.info(f"DRIVER block: {len(driver_data)} bytes (0x{len(driver_data):x})")
 
@@ -2592,26 +2262,10 @@ def run_flash_direct(
         sboot.authenticate()
 
         # --- Phase 2: Upload + execute ---
-        log.info(f"Uploading {'MVP test' if mvp else 'DRIVER + Flash Manager'}...")
-        exec_addr = SHELLCODE_ADDR + 0x900 if not mvp else SHELLCODE_ADDR
-        got_response = sboot.upload_and_execute(payload, address=SHELLCODE_ADDR,
-                                                 execute_address=exec_addr)
-
-        if mvp:
-            # MVP: shellcode writes DSPR marker, blasts CAN, then RETs.
-            # If RET works, sboot_execute sends positive response → got_response=True
-            print("\n  MVP shellcode uploaded + executed.")
-            print("  Check candump for CAN frames from our MO writes.\n")
-
-            if got_response:
-                print("  *** EXECUTE PHASE 2 GOT RESPONSE — CODE EXECUTED & RETURNED! ***")
-                print("  Code execution from PSPR confirmed (RET worked).")
-                print("  If no frames in candump → our direct MO writes don't TX.")
-                print("  SBOOT's own CAN TX works fine (it sent the response).")
-            else:
-                print("  Execute phase 2: no response (timeout).")
-                print("  Code either trapped, hung, or never executed.")
-            return
+        log.info("Uploading DRIVER + Flash Manager...")
+        exec_addr = SHELLCODE_ADDR + 0x900
+        sboot.upload_and_execute(payload, address=SHELLCODE_ADDR,
+                                 execute_address=exec_addr)
 
         # Give shellcode time to initialize and find MOs
         time.sleep(0.5)
@@ -2807,8 +2461,6 @@ Examples:
                           help="Read N bytes from address (hex), e.g. --read-addr 0xA0020000")
     p_direct.add_argument("--read-len", type=lambda x: int(x, 0), default=256,
                           help="Bytes to read with --read-addr (default 256)")
-    p_direct.add_argument("--mvp", nargs="?", const=True, default=False,
-                          help="Upload test shellcode (candump to verify). Optional: 'fm-blast'")
     p_direct.add_argument("-v", "--verbose", action="store_true")
 
     p_dump = sub.add_parser("dump",
@@ -2835,7 +2487,6 @@ Examples:
             relay_gpio=args.relay_gpio,
             power_off_time=args.power_off_time,
             ping_only=args.ping_only,
-            mvp=args.mvp,
             read_addr=getattr(args, 'read_addr', None),
             read_len=getattr(args, 'read_len', 256),
             skip_erase=getattr(args, 'skip_erase', False),
@@ -2851,14 +2502,8 @@ Examples:
 
 def run_dump_full(out_path: str, can_interface: str = "can0",
                   relay_gpio: int | None = None, power_off_time: float = 2.0):
-    """Dump entire PFlash (2MB) via SBOOT exploit + Flash Manager read command.
-
-    TC1766 PFlash layout:
-      PFlash0: 0xA0000000 - 0xA00FFFFF (1MB)
-      PFlash1: 0xA0100000 - 0xA01FFFFF (1MB)
-    Total: 2MB
-    """
-    # TC1766 PFlash: 2MB total
+    """Dump entire PFlash (2MB) via SBOOT exploit + Flash Manager read command."""
+    # TC1766 PFlash: 1.5MB total
     PFLASH_START = 0xA0000000
     PFLASH_SIZE = 0x170000  # 1472KB — ASW ends at 0xA016FFFF, rest is empty
 
@@ -2883,14 +2528,6 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
             raise RuntimeError("Failed to enter SBOOT session")
         sboot.authenticate()
         log.info("SBOOT authenticated")
-
-        # Build and upload Flash Manager (need a dummy bin for DRIVER)
-        # Use a minimal DRIVER — we only need READ, not erase/write
-        # But FM shellcode needs DRIVER base for WDT callback address.
-        # We'll upload FM without DRIVER and use a standalone WDT callback.
-        # Actually, for read-only we still need the FM shellcode structure.
-        # Simplest: reuse the flash upload path with any bin that has DRIVER.
-        # OR: build FM with driver_base=0 (no DRIVER calls needed for reads).
 
         # Build FM shellcode for read-only (no DRIVER needed)
         driver_base = SHELLCODE_ADDR  # 0xD4000000 — doesn't matter for reads
@@ -2945,7 +2582,6 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
         fm.reset()
 
         print(f"\n  Full PFlash dump: {out_path} ({len(dump)} bytes)")
-        print(f"  Load in Ghidra as TC1766, base 0x{PFLASH_START:08X}\n")
 
     except Exception as e:
         log.error(f"Dump failed: {e}")
