@@ -1674,6 +1674,25 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_load32(5, MOCTR_RESTXPND)
     sc += _tc_st_w(9, MO_MOCTR, 5)
 
+    # --- Inline WDT service (prevents reset during long reads) ---
+    # Uses d5, d7, d15 as temps (free here), a6/a7 = WDT_CON0/CON1 (persistent)
+    sc += _tc_mov_u(5, 0xFF01)
+    sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFF01
+    sc += _tc_ld_w(15, 6, 0)             # d15 = WDT_CON0
+    sc += _tc_ld_w(7, 7, 0)              # d7 = WDT_CON1
+    sc += _tc_and(15, 15, 5)             # d15 &= 0xFFFFFF01
+    sc += _tc_or_imm(15, 15, 0xF0)       # d15 |= 0xF0
+    sc += _tc_and_imm(7, 7, 0xC)         # d7 &= 0xC (HPW bits)
+    sc += _tc_or_rr(15, 15, 7)           # d15 |= d7
+    sc += _tc_st_w(6, 0, 15)             # WDT_CON0 = password access
+    sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
+    sc += _tc_mov_u(5, 0xFFF0)
+    sc += _tc_addih(5, 5, 0xFFFF)         # d5 = 0xFFFFFFF0
+    sc += _tc_and(15, 15, 5)             # d15 &= 0xFFFFFFF0
+    sc += _tc_or_imm(15, 15, 0x3)         # d15 |= 0x3 (LCK=1, ENDINIT=1)
+    sc += _tc_st_w(6, 0, 15)             # WDT_CON0 = modify (service)
+    sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
+
     # Advance: a3 += 4, d4 -= 4, d14 += 1
     sc += _tc_lea(3, 3, 4)
     sc += _tc_addi(4, 4, -4 & 0xFFFF)  # ADDI const16 is sign-extended
@@ -2847,11 +2866,11 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
     """
     # TC1766 PFlash: 2MB total
     PFLASH_START = 0xA0000000
-    PFLASH_SIZE = 0x200000  # 2MB
+    PFLASH_SIZE = 0x178000  # 1504KB (PFlash0=1MB + PFlash1=480KB)
 
     print("\n" + "=" * 60)
     print("  DQ250 Full PFlash Dump")
-    print(f"  Range: 0x{PFLASH_START:08X} - 0x{PFLASH_START + PFLASH_SIZE - 1:08X} ({PFLASH_SIZE // 1024}KB)")
+    print(f"  Range: 0x{PFLASH_START:08X} - 0x{PFLASH_START + PFLASH_SIZE - 1:08X} ({PFLASH_SIZE // 1024} KB)")
     print(f"  Output: {out_path}")
     print("=" * 60 + "\n")
 
@@ -2911,7 +2930,7 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
 
         # Dump entire PFlash
         dump = bytearray()
-        chunk_size = 256  # read_flash reads this many bytes at a time
+        chunk_size = 256
         total_chunks = PFLASH_SIZE // chunk_size
 
         for i in range(total_chunks):
