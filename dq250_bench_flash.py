@@ -34,6 +34,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 from collections import deque
 
 import gmpy2
@@ -98,6 +99,41 @@ WORKSHOP_CODE = bytes([0x20, 0x4, 0x20, 0x42, 0x04, 0x20, 0x42, 0xB1, 0x3D])
 # Memory table entry 8: 0xD4000000-0xD4003FFF, flags 0x1C00 (RAM, 16KB)
 # Also valid: 0xD0000000-0xD0000FFF (4KB only)
 SHELLCODE_ADDR = 0xD4000000
+
+
+def jamcrc(data: bytes) -> int:
+    """JAMCRC = bitwise NOT of CRC32 (used by DSG for internal block checksums)."""
+    return 0xFFFFFFFF - zlib.crc32(data)
+
+
+def verify_block_jamcrc(bin_data: bytes, block_name: str) -> tuple[bool, int, int]:
+    """
+    Verify JAMCRC of a block in the bin file.
+    Returns (valid, expected_crc, actual_crc).
+    JAMCRC is stored in the last 4 bytes of each block.
+    DRIVER (block 2) uses external UDS checksum, not JAMCRC — skip it.
+    """
+    info = BLOCKS[block_name]
+    offset = info["bin_offset"]
+    length = info["length"]
+    block_data = bin_data[offset:offset + length]
+
+    if len(block_data) < 4:
+        return (False, 0, 0)
+
+    stored_crc = struct.unpack("<I", block_data[-4:])[0]
+    calc_crc = jamcrc(block_data[:-4])
+    return (stored_crc == calc_crc, stored_crc, calc_crc)
+
+
+def fix_block_jamcrc(bin_data: bytearray, block_name: str) -> int:
+    """Fix JAMCRC in a block. Returns the new CRC. Modifies bin_data in-place."""
+    info = BLOCKS[block_name]
+    offset = info["bin_offset"]
+    length = info["length"]
+    crc = jamcrc(bin_data[offset:offset + length - 4])
+    struct.pack_into("<I", bin_data, offset + length - 4, crc)
+    return crc
 
 
 # ---------------------------------------------------------------------------
@@ -2042,9 +2078,51 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     reset_jne_pos = len(sc)
     sc += _tc_jne(5, 0, 0)
 
-    # RESET: write to SCU_RSTCON to trigger SW reset
+    # RESET: Write DSPR warm boot magic for CBOOT, then Application Reset.
+    #
+    # CBOOT's cboot_check_asw_valid checks:
+    #   d000dffc == 0x5353015B  (warm boot magic 1)
+    #   d000dff8 == 0xACACFEA4  (complement)
+    #   d000dff4 == 0x25A5A5A2  (programming complete → clears NVM error flags)
+    #
+    # The 0x25A5A5A2 path validates CRC, clears sticky NVM error bits (1-3,5-6),
+    # writes NVM, then falls through to cold boot validate which succeeds
+    # because fingerprints match and flags are now clean.
+    # This makes the fix PERMANENT — survives power cycles.
+
+    # Write warm boot magic to DSPR
+    sc += _tc_load_addr(2, 0xD000DFF4)
+    sc += _tc_load32(0, 0x25A5A5A2)         # programming complete magic
+    sc += _tc_st_w(2, 0, 0)                 # *(d000dff4) = 0x25A5A5A2
+    sc += _tc_load32(0, 0xACACFEA4)         # complement of 0x5353015B
+    sc += _tc_st_w(2, 4, 0)                 # *(d000dff8) = 0xACACFEA4
+    sc += _tc_load32(0, 0x5353015B)         # warm boot magic
+    sc += _tc_st_w(2, 8, 0)                 # *(d000dffc) = 0x5353015B
+
+    # Disable ENDINIT (required for SCU_RSTCON write)
+    # Password Access: WDT_CON0 = (WDT_CON0 & 0xFFFFFF01) | 0xF0 | (WDT_CON1 & 0xC)
+    sc += _tc_mov_u(5, 0xFF01)
+    sc += _tc_addih(5, 5, 0xFFFF)           # d5 = 0xFFFFFF01
+    sc += _tc_ld_w(15, 6, 0)               # d15 = WDT_CON0
+    sc += _tc_ld_w(7, 7, 0)                # d7 = WDT_CON1
+    sc += _tc_and(15, 15, 5)               # d15 &= 0xFFFFFF01
+    sc += _tc_or_imm(15, 15, 0xF0)         # d15 |= 0xF0
+    sc += _tc_and_imm(7, 7, 0xC)           # d7 &= 0xC
+    sc += _tc_or_rr(15, 15, 7)             # d15 |= d7
+    sc += _tc_st_w(6, 0, 15)               # WDT_CON0 = password access
+    sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
+    # Modify: ENDINIT=0
+    sc += _tc_mov_u(5, 0xFFF0)
+    sc += _tc_addih(5, 5, 0xFFFF)           # d5 = 0xFFFFFFF0
+    sc += _tc_and(15, 15, 5)               # d15 &= 0xFFFFFFF0
+    sc += _tc_or_imm(15, 15, 0x2)          # d15 |= 0x2 (LCK=1, ENDINIT=0)
+    sc += _tc_st_w(6, 0, 15)               # WDT_CON0 = modify
+    sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
+
+    # Application Reset via SCU_RSTCON (preserves DSPR!)
+    # TC1766 SCU_RSTCON bits[1:0]: 01=Application Reset, 10=System Reset
     sc += _tc_load_addr(2, SCU_RSTCON)
-    sc += _tc_load32(0, 0x02)  # SW reset request (bit 1)
+    sc += _tc_load32(0, 0x01)              # Application Reset (NOT System Reset!)
     sc += _tc_st_w(2, 0, 0)
     # Spin (should not reach here)
     sc += _tc_j16(0xFE)  # infinite loop (J -2)
@@ -2321,9 +2399,6 @@ def run_flash_direct(
     relay_gpio: int | None = None,
     power_off_time: float = 2.0,
     ping_only: bool = False,
-    dump_only: bool = False,
-    dump_file: str | None = None,
-    skip_dump: bool = False,
     mvp: bool = False,
     read_addr: int | None = None,
     read_len: int = 256,
@@ -2342,6 +2417,16 @@ def run_flash_direct(
     bin_data = pathlib.Path(bin_path).read_bytes()
     if len(bin_data) != 0x180000:
         log.warning(f"Binary size 0x{len(bin_data):x} != expected 0x180000")
+
+    # Verify JAMCRC before flashing (SBOOT checks this on every boot)
+    if not mvp:
+        for bname in ["ASW", "CAL"]:
+            valid, stored, calc = verify_block_jamcrc(bin_data, bname)
+            if valid:
+                log.info(f"  {bname} JAMCRC: 0x{stored:08X} OK")
+            else:
+                log.error(f"  {bname} JAMCRC: stored=0x{stored:08X}, calc=0x{calc:08X} MISMATCH!")
+                raise ValueError(f"{bname} JAMCRC invalid — SBOOT will reject. Fix JAMCRC in bin file first.")
 
     if mvp == "fm-blast":
         # Test: exact FM debug blast (MO1 only) + RET
@@ -2486,7 +2571,7 @@ def run_flash_direct(
         print(f"  Blocks:  {', '.join(block_names)}")
     print(f"  CAN:     {can_interface}")
     print(f"  Payload: {len(payload)} bytes → 0x{SHELLCODE_ADDR:08x}")
-    print("  Flow:    SBOOT auth → upload → PING → dump → flash")
+    print("  Flow:    SBOOT auth → upload → PING → flash → reset")
     print("=" * 60 + "\n")
 
     can = RawCAN(can_interface)
@@ -2556,85 +2641,10 @@ def run_flash_direct(
                 hexbytes = ' '.join(f'{b:02x}' for b in data[off:off+16])
                 ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[off:off+16])
                 print(f"  {read_addr+off:08x}: {hexbytes:<48s} {ascii_str}")
-            if dump_file:
-                pathlib.Path(dump_file).write_bytes(data)
-                log.info(f"Saved to {dump_file}")
             fm.reset()
             return
 
-        # --- Phase 4: Safety dump ---
-        if not skip_dump:
-            dump_blocks = ["CAL", "ASW"]  # DRIVER is RAM-only, not in flash
-            all_dumps: dict[str, bytes] = {}
-
-            for bname in dump_blocks:
-                binfo = BLOCKS[bname]
-                baddr = binfo["flash_addr"]
-                if baddr is None:
-                    continue
-                blen = binfo["length"]
-                log.info(f"Dumping {bname}: 0x{baddr:08x}, {blen} bytes...")
-
-                dump_data = bytearray()
-                chunk_size = 256  # 256 bytes per read = 64 CAN frames
-                for off in range(0, blen, chunk_size):
-                    chunk = fm.read_flash(baddr + off, min(chunk_size, blen - off))
-                    dump_data.extend(chunk)
-                    if off % 0x4000 == 0:
-                        pct = 100 * off // blen
-                        log.info(f"  {bname}: {pct}% ({off:#x}/{blen:#x})")
-
-                log.info(f"  {bname} dump complete: {len(dump_data)} bytes")
-                all_dumps[bname] = bytes(dump_data)
-
-                # Compare with bin file
-                expected = bin_data[binfo["bin_offset"]:binfo["bin_offset"] + blen]
-                if dump_data == expected:
-                    log.info(f"  {bname} matches binary — OK")
-                else:
-                    diffs = sum(1 for a, b in zip(dump_data, expected) if a != b)
-                    log.warning(f"  {bname} differs from binary at {diffs} bytes!")
-                    # Show first 10 diff locations for diagnosis
-                    diff_locs = []
-                    zero_count = 0
-                    for i, (a, b) in enumerate(zip(dump_data, expected)):
-                        if a != b:
-                            if len(diff_locs) < 10:
-                                diff_locs.append((i, a, b))
-                            if a == 0:
-                                zero_count += 1
-                    log.warning(f"  {zero_count}/{diffs} diff bytes are 0x00 in dump (= not written/erased)")
-                    for off, got, exp in diff_locs:
-                        addr = binfo["flash_addr"] + off
-                        log.warning(f"    offset 0x{off:06x} (0x{addr:08x}): got 0x{got:02x}, expected 0x{exp:02x}")
-                    # Show range of diffs
-                    first_diff = next(i for i, (a, b) in enumerate(zip(dump_data, expected)) if a != b)
-                    last_diff = len(dump_data) - 1 - next(i for i, (a, b) in enumerate(zip(reversed(dump_data), reversed(expected))) if a != b)
-                    log.warning(f"  Diff range: offset 0x{first_diff:06x}..0x{last_diff:06x} (0x{binfo['flash_addr']+first_diff:08x}..0x{binfo['flash_addr']+last_diff:08x})")
-
-            if dump_file:
-                # Save each block as blockname_dumpfile
-                base = pathlib.Path(dump_file)
-                for bname, bdata in all_dumps.items():
-                    p = base.with_stem(f"{base.stem}_{bname.lower()}")
-                    p.write_bytes(bdata)
-                    log.info(f"  Saved {bname} to {p}")
-            else:
-                # Save blocks that differ
-                for bname, bdata in all_dumps.items():
-                    binfo = BLOCKS[bname]
-                    expected = bin_data[binfo["bin_offset"]:binfo["bin_offset"] + binfo["length"]]
-                    if bdata != expected:
-                        safety_path = pathlib.Path(bin_path).stem + f"_{bname.lower()}_dump.bin"
-                        pathlib.Path(safety_path).write_bytes(bdata)
-                        log.info(f"  Safety dump saved to {safety_path}")
-
-        if dump_only:
-            print("\n  Dump complete!")
-            fm.reset()
-            return
-
-        # --- Phase 5: Erase + Write + Verify ---
+        # --- Phase 4: Erase + Write + Verify ---
         flash_order = [n.upper() for n in block_names if n.upper() in BLOCKS]
         # For direct flash, we don't need DSG encryption — raw data goes to DRIVER
         for name in flash_order:
@@ -2753,7 +2763,7 @@ def run_flash_direct(
 
         print("\n" + "=" * 60)
         print("  DIRECT FLASH COMPLETE!")
-        print("  Run 'finalize' after power-cycle to set DIDs")
+        print("  CBOOT warm boot magic written — ASW will boot on reset.")
         print("=" * 60 + "\n")
 
     except Exception as e:
@@ -2773,16 +2783,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s flash-direct --bin 0D9300042M.bin --blocks DRIVER ASW CAL --relay-gpio 17
-  %(prog)s flash-direct --bin 0D9300042M.bin --ping-only --relay-gpio 17
-  %(prog)s dump-full --out full_pflash.bin --relay-gpio 17
-  %(prog)s finalize --can can0
+  %(prog)s flash --bin 0D9300042M.bin --blocks DRIVER ASW CAL --relay-gpio 17
+  %(prog)s flash --bin 0D9300042M.bin --ping-only --relay-gpio 17
+  %(prog)s dump --out full_pflash.bin --relay-gpio 17
 """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- flash-direct ---
-    p_direct = sub.add_parser("flash-direct",
+    # --- flash ---
+    p_direct = sub.add_parser("flash",
                               help="Direct flash via DRIVER (bypass CBOOT)")
     p_direct.add_argument("--bin", required=True, help="DQ250 binary (1.5MB)")
     p_direct.add_argument("--blocks", nargs="+", default=["DRIVER", "ASW", "CAL"],
@@ -2792,11 +2801,6 @@ Examples:
     p_direct.add_argument("--power-off-time", type=float, default=2.0)
     p_direct.add_argument("--ping-only", action="store_true",
                           help="Only test PING (no flash)")
-    p_direct.add_argument("--dump-only", action="store_true",
-                          help="Dump all blocks (DRIVER, CAL, ASW) then exit")
-    p_direct.add_argument("--dump-file", help="Save flash dump to file")
-    p_direct.add_argument("--skip-dump", action="store_true",
-                          help="Skip safety dump before flashing")
     p_direct.add_argument("--skip-erase", action="store_true",
                           help="Skip erase step (use when flash is already erased)")
     p_direct.add_argument("--read-addr", type=lambda x: int(x, 0),
@@ -2807,12 +2811,7 @@ Examples:
                           help="Upload test shellcode (candump to verify). Optional: 'fm-blast'")
     p_direct.add_argument("-v", "--verbose", action="store_true")
 
-    p_finalize = sub.add_parser("finalize",
-                                help="UDS finalization after direct flash (SA2 + CheckProgrammingDependencies)")
-    p_finalize.add_argument("--can", default="can0")
-    p_finalize.add_argument("-v", "--verbose", action="store_true")
-
-    p_dump = sub.add_parser("dump-full",
+    p_dump = sub.add_parser("dump",
                             help="Dump entire PFlash via SBOOT + Flash Manager")
     p_dump.add_argument("--out", required=True, help="Output file path")
     p_dump.add_argument("--can", default="can0")
@@ -2828,7 +2827,7 @@ Examples:
         datefmt="%H:%M:%S",
     )
 
-    if args.command == "flash-direct":
+    if args.command == "flash":
         run_flash_direct(
             bin_path=args.bin,
             block_names=[b.upper() for b in args.blocks],
@@ -2836,17 +2835,12 @@ Examples:
             relay_gpio=args.relay_gpio,
             power_off_time=args.power_off_time,
             ping_only=args.ping_only,
-            dump_only=args.dump_only,
-            dump_file=args.dump_file,
-            skip_dump=args.skip_dump,
             mvp=args.mvp,
             read_addr=getattr(args, 'read_addr', None),
             read_len=getattr(args, 'read_len', 256),
             skip_erase=getattr(args, 'skip_erase', False),
         )
-    elif args.command == "finalize":
-        run_finalize(can_interface=args.can)
-    elif args.command == "dump-full":
+    elif args.command == "dump":
         run_dump_full(
             out_path=args.out,
             can_interface=args.can,
@@ -2866,7 +2860,7 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
     """
     # TC1766 PFlash: 2MB total
     PFLASH_START = 0xA0000000
-    PFLASH_SIZE = 0x178000  # 1504KB (PFlash0=1MB + PFlash1=480KB)
+    PFLASH_SIZE = 0x170000  # 1472KB — ASW ends at 0xA016FFFF, rest is empty
 
     print("\n" + "=" * 60)
     print("  DQ250 Full PFlash Dump")
@@ -2895,7 +2889,7 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
         # But FM shellcode needs DRIVER base for WDT callback address.
         # We'll upload FM without DRIVER and use a standalone WDT callback.
         # Actually, for read-only we still need the FM shellcode structure.
-        # Simplest: reuse the flash-direct upload path with any bin that has DRIVER.
+        # Simplest: reuse the flash upload path with any bin that has DRIVER.
         # OR: build FM with driver_base=0 (no DRIVER calls needed for reads).
 
         # Build FM shellcode for read-only (no DRIVER needed)
@@ -2955,86 +2949,6 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
 
     except Exception as e:
         log.error(f"Dump failed: {e}")
-        raise
-    finally:
-        can.close()
-
-
-def run_finalize(can_interface: str):
-    """UDS finalization: SA2 auth + workshop fingerprint + CheckProgrammingDependencies."""
-    print("\n" + "=" * 60)
-    print("  UDS Finalization")
-    print(f"  CAN: {can_interface} (0x7E1/0x7E9)")
-    print("=" * 60 + "\n")
-
-    can = RawCAN(can_interface)
-    can.drain()
-    isotp = ISOTP(can, tx_id=0x7E1, rx_id=0x7E9)
-    client = UDSClient(isotp, timeout=5.0)
-
-    try:
-        # Extended session
-        log.info("Extended Session...")
-        client.diagnostic_session_control(0x03)
-        client.tester_present()
-
-        # Try programming session (may fail with NRC 0x22 on bench)
-        try:
-            log.info("Programming Session...")
-            client.diagnostic_session_control(0x02)
-            client.tester_present()
-
-            # SA2 authentication
-            log.info("SA2 authentication (level 17)...")
-            client.unlock_sa2(17, SA2_SCRIPT)
-            client.tester_present()
-
-            # Write workshop code / fingerprint
-            log.info("Writing workshop fingerprint...")
-            client.write_data_by_identifier(0xF15A, WORKSHOP_CODE)
-            client.tester_present()
-        except UDSError as e:
-            log.warning(f"Programming session failed: {e} — trying from extended session")
-
-        # CheckProgrammingDependencies — try from whatever session we're in
-        log.info("CheckProgrammingDependencies (0xFF01)...")
-        try:
-            resp = client.routine_control_start(0xFF01)
-            log.info(f"  Response: {resp.hex()}")
-        except UDSError as e:
-            log.warning(f"  0xFF01 failed: {e}")
-
-        # Try RoutineControl 0x0203 (check flash errors)
-        log.info("Check flash errors (0x0203)...")
-        try:
-            resp = client.routine_control_start(0x0203)
-            log.info(f"  Response: {resp.hex()}")
-            if len(resp) > 4:
-                log.info(f"  Error codes: {[f'0x{b:02x}' for b in resp[4:]]}")
-            else:
-                log.info("  No error codes — flash check PASSED!")
-        except UDSError as e:
-            log.warning(f"  0x0203 failed: {e}")
-
-        # Read some DIDs to check
-        for did, name in [(0xF187, "Spare Part Nr"), (0xF189, "ASW Version"),
-                          (0xF197, "System Name"), (0x0600, "Coding")]:
-            try:
-                resp = client._request(bytes([0x22, did >> 8, did & 0xFF]))
-                log.info(f"  DID 0x{did:04X} ({name}): {resp[3:].hex()} = {resp[3:]}")
-            except UDSError as e:
-                log.info(f"  DID 0x{did:04X} ({name}): {e}")
-
-        # Reset
-        log.info("ECU reset...")
-        try:
-            client.ecu_reset(0x01)
-        except TimeoutError:
-            pass  # ECU resets before responding
-
-        print("\n  Finalization complete!\n")
-    except (UDSError, TimeoutError) as e:
-        log.error(f"Finalization failed: {e}")
         raise
     finally:
         can.close()
