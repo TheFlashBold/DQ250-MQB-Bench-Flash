@@ -4,6 +4,8 @@ Bench flashing tool for DQ250 MQB DSG transmission control units (TCU) over CAN.
 
 Exploits a weakness in SBOOT (Bleichenbacher RSA e=3 forge) to flash the TCU directly on the bench without OEM diagnostic software.
 
+Credits: [bri3d](https://github.com/bri3d) for the exploit and hints.
+
 ## Requirements
 
 - Linux with SocketCAN (`can0`)

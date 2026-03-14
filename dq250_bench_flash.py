@@ -5,23 +5,11 @@ DQ250 MQB SBOOT Bench Flash Tool
 Exploits SBOOT's UDS-like protocol on CAN ID 0x640 to bypass ASW
 programming preconditions for bench flashing.
 
-Flow:
-  1. Power on ECU, spam keep-alive on 0x640 → keep SBOOT in main loop
-     (any CAN msg resets bVar4 in cboot_main_loop, preventing ASW jump)
-  2. 1A 8F → set required flag (phase 1→2)
-  3. 1A 8A → read data (phase 2→3)
-  4. 1A 8B → unlock SA (phase 3→4)
-  5. 27 FD/FE → Bleichenbacher RSA-1024 e=3 authentication (phase 4→6)
-  4. 31 FB 01 → programming preconditions
-  5. 34/36/37 → upload shellcode to DSPR RAM (0xD4000000)
-  6. 38 × 2 → execute shellcode (writes reprogram magic + re-enables WDT + spin)
-  7. WDT reset → cboot_check_reprogram_request finds 0x55AA1234 → CBOOT programming mode
-  8. CBOOT on 0x7E1/0x7E9: SA2 → flash blocks → verify → reset
+Credits: https://github.com/bri3d for the exploit and hints.
 
 Usage:
-  python3 dq250_bench_flash.py flash --bin 0D9300042M_patched.bin --blocks DRIVER ASW CAL
-  python3 dq250_bench_flash.py auth-test            # Test SBOOT auth only
-  python3 dq250_bench_flash.py upload --shellcode sc.bin  # Upload + execute custom shellcode
+  python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --blocks ASW CAL
+  python3 dq250_bench_flash.py dump --out pflash_dump.bin
 """
 
 import argparse
