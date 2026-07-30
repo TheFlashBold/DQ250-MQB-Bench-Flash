@@ -88,6 +88,18 @@ WORKSHOP_CODE = bytes([0x20, 0x4, 0x20, 0x42, 0x04, 0x20, 0x42, 0xB1, 0x3D])
 # Also valid: 0xD0000000-0xD0000FFF (4KB only)
 SHELLCODE_ADDR = 0xD4000000
 
+# TC1766 DFlash / EEPROM layout.
+#
+# The device has two separately erasable 16KB DFlash banks.  They are not
+# contiguous in the address map, so EEPROM files store bank 0 followed by
+# bank 1 without the address-space gap.
+DFLASH_BANKS = (
+    (0xAFE00000, 0x4000),
+    (0xAFE10000, 0x4000),
+)
+DFLASH_PAGE_SIZE = 0x80
+EEPROM_SIZE = sum(size for _, size in DFLASH_BANKS)
+
 
 def jamcrc(data: bytes) -> int:
     """JAMCRC = bitwise NOT of CRC32 (used by DSG for internal block checksums)."""
@@ -1163,6 +1175,31 @@ FM_CMD_RESET = 0xFF
 FM_WRITE_ACK_INTERVAL = 64
 
 
+def _validate_driver_layout(driver_data: bytes):
+    """Reject DRIVER blocks that do not match the hard-coded entry offsets."""
+    if len(driver_data) != DRIVER_SIZE:
+        raise ValueError(
+            f"DRIVER must be 0x{DRIVER_SIZE:x} bytes, got 0x{len(driver_data):x}"
+        )
+
+    # The DRIVER header contains its linked entry-point table.  The Flash
+    # Manager calls these exact offsets, so accepting a different layout would
+    # jump into arbitrary code during erase/program.
+    expected_entries = (
+        SHELLCODE_ADDR + DRIVER_EXIT_OFF,
+        SHELLCODE_ADDR + 0x14,
+        SHELLCODE_ADDR + DRIVER_ERASE_OFF,
+        SHELLCODE_ADDR + DRIVER_PROGVER_OFF,
+    )
+    actual_entries = struct.unpack_from("<4I", driver_data, 4)
+    if actual_entries != expected_entries:
+        actual = ", ".join(f"0x{entry:08X}" for entry in actual_entries)
+        expected = ", ".join(f"0x{entry:08X}" for entry in expected_entries)
+        raise ValueError(
+            f"Unsupported DRIVER entry layout ({actual}); expected {expected}"
+        )
+
+
 def _tc_ret() -> bytes:
     """RET — return from call. Restores upper context from CSA."""
     return bytes([0x00, 0x90])
@@ -1997,6 +2034,51 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     return bytes(sc)
 
 
+def _build_flash_manager_payload(driver_data: bytes | None = None) -> tuple[bytes, int]:
+    """Build a PSPR payload and return ``(payload, execute_address)``.
+
+    Read-only operations can omit the DRIVER.  Erase/program operations must
+    include the 0x80e-byte DRIVER block at its linked address 0xD4000000.
+    """
+    driver_base = SHELLCODE_ADDR
+    if driver_data is None:
+        fm_offset = 0x100
+        prefix = b'\x00' * fm_offset
+    else:
+        _validate_driver_layout(driver_data)
+        fm_offset = 0x900
+        prefix = driver_data.ljust(fm_offset, b'\x00')
+
+    fm_base = SHELLCODE_ADDR + fm_offset
+    dummy_fm = _build_flash_manager(
+        driver_base, 0xD4002000, 0xD4002040, shellcode_base=fm_base
+    )
+    param_offset = fm_offset + ((len(dummy_fm) + 0x3F) & ~0x3F)
+    param_base = SHELLCODE_ADDR + param_offset
+    buffer_base = param_base + 0x40
+    flasher_code = _build_flash_manager(
+        driver_base, param_base, buffer_base, shellcode_base=fm_base
+    )
+    if len(flasher_code) > param_offset - fm_offset:
+        raise ValueError(
+            f"Flash Manager 0x{len(flasher_code):x} bytes exceeds reserved area"
+        )
+
+    payload = prefix + flasher_code
+    payload = payload.ljust(param_offset + 0x40, b'\x00')
+    if len(payload) > 0x4000:
+        raise ValueError(f"Payload too large for PSPR: {len(payload)} > 16384")
+
+    log.info(
+        f"Flash Manager: {len(flasher_code)} bytes at "
+        f"0x{fm_base:08X}, buffer 0x{buffer_base:08X}"
+    )
+    if driver_data is not None:
+        log.info(f"DRIVER: {len(driver_data)} bytes at 0x{driver_base:08X}")
+    log.info(f"Total payload: {len(payload)} bytes")
+    return payload, fm_base
+
+
 # ---------------------------------------------------------------------------
 # Flash Manager protocol client
 # ---------------------------------------------------------------------------
@@ -2183,44 +2265,8 @@ def run_flash_direct(
             log.error(f"  {bname} JAMCRC: stored=0x{stored:08X}, calc=0x{calc:08X} MISMATCH!")
             raise ValueError(f"{bname} JAMCRC invalid — SBOOT will reject. Fix JAMCRC in bin file first.")
 
-    # Extract DRIVER block
-        driver_data = extract_block(bin_data, "DRIVER")
-        log.info(f"DRIVER block: {len(driver_data)} bytes (0x{len(driver_data):x})")
-
-        # Layout: DRIVER at offset 0 (base 0xD4000000 — its expected address),
-        # FM shellcode at offset 0x900, execute from 0xD4000900.
-        # DRIVER is NOT position-independent — must be at its original base.
-        driver_base = SHELLCODE_ADDR  # 0xD4000000
-        fm_offset = 0x900  # after DRIVER (0x80E bytes + padding)
-        fm_base = SHELLCODE_ADDR + fm_offset  # 0xD4000900
-
-        # Param struct and buffer after FM
-        dummy_fm = _build_flash_manager(driver_base, 0xD4002000, 0xD4002040,
-                                        shellcode_base=fm_base)
-        fm_size = len(dummy_fm)
-        param_offset = fm_offset + ((fm_size + 0x3F) & ~0x3F)
-        param_base = SHELLCODE_ADDR + param_offset
-        buffer_base = param_base + 0x40
-
-        # Rebuild FM with correct addresses
-        flasher_code = _build_flash_manager(driver_base, param_base, buffer_base,
-                                            shellcode_base=fm_base)
-        assert len(flasher_code) <= (param_offset - fm_offset), \
-            f"FM code {len(flasher_code)} bytes exceeds param offset"
-
-        # Combine: DRIVER at offset 0, FM at fm_offset
-        payload = driver_data.ljust(fm_offset, b'\x00')  # DRIVER + padding
-        payload += flasher_code  # FM shellcode
-        # Ensure param struct area is zeroed
-        payload = payload.ljust(param_offset + 0x40, b'\x00')
-
-        log.info(f"DRIVER: {len(driver_data)} bytes at offset 0 (0x{driver_base:08x})")
-        log.info(f"Flash Manager: {len(flasher_code)} bytes at offset 0x{fm_offset:x} (0x{fm_base:08x})")
-        log.info(f"Param struct: 0x{param_base:08x}, Buffer: 0x{buffer_base:08x}")
-        log.info(f"Total payload: {len(payload)} bytes")
-
-    if len(payload) > 0x4000:
-        raise ValueError(f"Payload too large for PSPR: {len(payload)} > 16384")
+    driver_data = extract_block(bin_data, "DRIVER")
+    payload, exec_addr = _build_flash_manager_payload(driver_data)
 
     print("\n" + "=" * 60)
     print("  DQ250 Direct Flash (DRIVER in PSPR)")
@@ -2251,7 +2297,6 @@ def run_flash_direct(
 
         # --- Phase 2: Upload + execute ---
         log.info("Uploading DRIVER + Flash Manager...")
-        exec_addr = SHELLCODE_ADDR + 0x900
         sboot.upload_and_execute(payload, address=SHELLCODE_ADDR,
                                  execute_address=exec_addr)
 
@@ -2415,6 +2460,219 @@ def run_flash_direct(
         can.close()
 
 
+def _read_eeprom(fm: FlashManagerClient, chunk_size: int = 0x100) -> bytes:
+    """Read both non-contiguous DFlash banks into one contiguous EEPROM image."""
+    image = bytearray()
+    total_read = 0
+    for bank_index, (bank_addr, bank_size) in enumerate(DFLASH_BANKS):
+        log.info(
+            f"Reading DFlash bank {bank_index}: "
+            f"0x{bank_addr:08X}-0x{bank_addr + bank_size - 1:08X}"
+        )
+        for offset in range(0, bank_size, chunk_size):
+            length = min(chunk_size, bank_size - offset)
+            image.extend(fm.read_flash(bank_addr + offset, length))
+            total_read += length
+            if offset % 0x1000 == 0:
+                log.info(
+                    f"  EEPROM read: {100 * total_read // EEPROM_SIZE}% "
+                    f"(0x{bank_addr + offset:08X})"
+                )
+    return bytes(image)
+
+
+def _start_flash_manager(
+    can: RawCAN,
+    payload: bytes,
+    execute_address: int,
+    relay_gpio: int | None,
+    power_off_time: float,
+) -> FlashManagerClient:
+    """Power-cycle, authenticate SBOOT, upload the payload, and verify PING."""
+    can.drain()
+    if relay_gpio is not None:
+        power_cycle_relay(relay_gpio, off_time=power_off_time)
+    else:
+        power_cycle_manual()
+
+    sboot = SbootClient(can)
+    if not sboot.enter_session():
+        raise RuntimeError("Failed to enter SBOOT session")
+    sboot.authenticate()
+    log.info("SBOOT authenticated")
+    sboot.upload_and_execute(
+        payload, address=SHELLCODE_ADDR, execute_address=execute_address
+    )
+    time.sleep(0.5)
+    can.drain()
+
+    fm = FlashManagerClient(can, timeout=2.0)
+    response = fm.ping()
+    log.info(f"Flash Manager PING OK: {response.hex()}")
+    return fm
+
+
+def run_eeprom_dump(
+    out_path: str,
+    can_interface: str = "can0",
+    relay_gpio: int | None = None,
+    power_off_time: float = 2.0,
+):
+    """Dump both TC1766 DFlash banks to one 32KB raw EEPROM file."""
+    payload, execute_address = _build_flash_manager_payload()
+
+    print("\n" + "=" * 60)
+    print("  DQ250 EEPROM / DFlash Dump")
+    print(f"  Banks:   0x{DFLASH_BANKS[0][0]:08X}, 0x{DFLASH_BANKS[1][0]:08X}")
+    print(f"  Size:    0x{EEPROM_SIZE:X} ({EEPROM_SIZE // 1024} KB)")
+    print(f"  Output:  {out_path}")
+    print(f"  CAN:     {can_interface}")
+    print("=" * 60 + "\n")
+
+    can = RawCAN(can_interface)
+    try:
+        fm = _start_flash_manager(
+            can, payload, execute_address, relay_gpio, power_off_time
+        )
+        image = _read_eeprom(fm)
+        if len(image) != EEPROM_SIZE:
+            raise RuntimeError(
+                f"EEPROM dump has 0x{len(image):x} bytes, expected 0x{EEPROM_SIZE:x}"
+            )
+        pathlib.Path(out_path).write_bytes(image)
+        log.info(f"Saved EEPROM dump to {out_path}")
+        fm.reset()
+        print(f"\n  EEPROM dump complete: {out_path} ({len(image)} bytes)")
+    except Exception as exc:
+        log.error(f"EEPROM dump failed: {exc}")
+        raise
+    finally:
+        can.close()
+
+
+def run_eeprom_flash(
+    input_path: str,
+    driver_bin_path: str,
+    can_interface: str = "can0",
+    relay_gpio: int | None = None,
+    power_off_time: float = 2.0,
+    backup_out: str | None = None,
+    assume_yes: bool = False,
+):
+    """Erase, program, and read-back verify both TC1766 DFlash banks."""
+    image = pathlib.Path(input_path).read_bytes()
+    if len(image) != EEPROM_SIZE:
+        raise ValueError(
+            f"EEPROM image must be exactly 0x{EEPROM_SIZE:x} bytes "
+            f"({EEPROM_SIZE // 1024} KB), got 0x{len(image):x}"
+        )
+
+    firmware = pathlib.Path(driver_bin_path).read_bytes()
+    if len(firmware) < DRIVER_SIZE:
+        raise ValueError(
+            f"Driver binary is too small: need at least 0x{DRIVER_SIZE:x} bytes"
+        )
+    driver_data = extract_block(firmware, "DRIVER")
+    payload, execute_address = _build_flash_manager_payload(driver_data)
+
+    print("\n" + "=" * 60)
+    print("  DQ250 EEPROM / DFlash Flash")
+    print(f"  Input:   {input_path}")
+    print(f"  Driver:  {driver_bin_path}")
+    print(f"  Size:    0x{EEPROM_SIZE:X} ({EEPROM_SIZE // 1024} KB)")
+    print(f"  CAN:     {can_interface}")
+    print("  WARNING: both 16KB DFlash banks will be erased.")
+    print("=" * 60 + "\n")
+    if not assume_yes:
+        confirmation = input("Type FLASH to continue: ").strip()
+        if confirmation != "FLASH":
+            print("EEPROM flash cancelled.")
+            return
+
+    can = RawCAN(can_interface)
+    try:
+        fm = _start_flash_manager(
+            can, payload, execute_address, relay_gpio, power_off_time
+        )
+
+        # Always read before erasing.  This avoids unnecessary DFlash wear and
+        # makes --backup-out a reliable pre-flash backup.
+        old_image = _read_eeprom(fm)
+        if backup_out is not None:
+            pathlib.Path(backup_out).write_bytes(old_image)
+            log.info(f"Saved pre-flash EEPROM backup to {backup_out}")
+        if old_image == image:
+            log.info("EEPROM already matches the input; skipping erase/program")
+            fm.reset()
+            print("\n  EEPROM already matches — nothing written.")
+            return
+
+        # Each 16KB bank is one separately erasable TC1766 DFlash sector.
+        for bank_index, (bank_addr, bank_size) in enumerate(DFLASH_BANKS):
+            log.info(
+                f"Erasing DFlash bank {bank_index}: "
+                f"0x{bank_addr:08X}-0x{bank_addr + bank_size - 1:08X}"
+            )
+            status = fm.erase_sector(bank_addr, bank_size)
+            if status != 0:
+                raise RuntimeError(
+                    f"DFlash bank {bank_index} erase failed: status={status}"
+                )
+
+        file_offset = 0
+        for bank_index, (bank_addr, bank_size) in enumerate(DFLASH_BANKS):
+            bank_data = image[file_offset:file_offset + bank_size]
+            log.info(f"Programming DFlash bank {bank_index} at 0x{bank_addr:08X}")
+            for offset in range(0, bank_size, DFLASH_PAGE_SIZE):
+                page = bank_data[offset:offset + DFLASH_PAGE_SIZE]
+                if offset % 0x1000 == 0:
+                    written = file_offset + offset
+                    log.info(
+                        f"  EEPROM write: {100 * written // EEPROM_SIZE}% "
+                        f"(0x{bank_addr + offset:08X})"
+                    )
+                # TC1766 erased DFlash reads as zero.  Programming zero-only
+                # pages would add wear without changing their contents.
+                if page == b'\x00' * DFLASH_PAGE_SIZE:
+                    continue
+                fm.write_start(bank_addr + offset, len(page))
+                status = fm.write_data(page)
+                if status != 0:
+                    raise RuntimeError(
+                        f"EEPROM write failed at 0x{bank_addr + offset:08X}: "
+                        f"status={status}"
+                    )
+            file_offset += bank_size
+
+        log.info("Reading EEPROM back for byte-for-byte verification")
+        readback = _read_eeprom(fm)
+        if readback != image:
+            mismatch = next(
+                index
+                for index, (actual, expected) in enumerate(zip(readback, image))
+                if actual != expected
+            )
+            bank_index = 0 if mismatch < DFLASH_BANKS[0][1] else 1
+            bank_file_offset = sum(size for _, size in DFLASH_BANKS[:bank_index])
+            address = DFLASH_BANKS[bank_index][0] + mismatch - bank_file_offset
+            raise RuntimeError(
+                f"EEPROM verify mismatch at file offset 0x{mismatch:x} "
+                f"(0x{address:08X}): read 0x{readback[mismatch]:02X}, "
+                f"expected 0x{image[mismatch]:02X}"
+            )
+
+        log.info("EEPROM byte-for-byte verification OK")
+        fm.reset()
+        print("\n" + "=" * 60)
+        print("  EEPROM FLASH COMPLETE — read-back verification OK")
+        print("=" * 60 + "\n")
+    except Exception as exc:
+        log.error(f"EEPROM flash failed: {exc}")
+        raise
+    finally:
+        can.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2428,6 +2686,8 @@ Examples:
   %(prog)s flash --bin 0D9300042M.bin --blocks DRIVER ASW CAL --relay-gpio 17
   %(prog)s flash --bin 0D9300042M.bin --ping-only --relay-gpio 17
   %(prog)s dump --out full_pflash.bin --relay-gpio 17
+  %(prog)s eeprom-dump --out eeprom.bin --relay-gpio 17
+  %(prog)s eeprom-flash --in eeprom.bin --driver-bin 0D9300042M.bin --relay-gpio 17
 """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2459,6 +2719,36 @@ Examples:
     p_dump.add_argument("--power-off-time", type=float, default=2.0)
     p_dump.add_argument("-v", "--verbose", action="store_true")
 
+    p_eeprom_dump = sub.add_parser(
+        "eeprom-dump", help="Dump both DFlash banks to a raw 32KB EEPROM image"
+    )
+    p_eeprom_dump.add_argument("--out", required=True, help="Output EEPROM file")
+    p_eeprom_dump.add_argument("--can", default="can0")
+    p_eeprom_dump.add_argument("--relay-gpio", type=int)
+    p_eeprom_dump.add_argument("--power-off-time", type=float, default=2.0)
+    p_eeprom_dump.add_argument("-v", "--verbose", action="store_true")
+
+    p_eeprom_flash = sub.add_parser(
+        "eeprom-flash", help="Flash and verify a raw 32KB EEPROM image"
+    )
+    p_eeprom_flash.add_argument("--in", dest="input", required=True,
+                                help="Raw 32KB EEPROM image")
+    p_eeprom_flash.add_argument(
+        "--driver-bin", required=True,
+        help="DQ250 1.5MB binary providing the matching DRIVER block",
+    )
+    p_eeprom_flash.add_argument(
+        "--backup-out", help="Save the current EEPROM before erasing"
+    )
+    p_eeprom_flash.add_argument("--can", default="can0")
+    p_eeprom_flash.add_argument("--relay-gpio", type=int)
+    p_eeprom_flash.add_argument("--power-off-time", type=float, default=2.0)
+    p_eeprom_flash.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip the destructive-operation confirmation",
+    )
+    p_eeprom_flash.add_argument("-v", "--verbose", action="store_true")
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2485,6 +2775,23 @@ Examples:
             can_interface=args.can,
             relay_gpio=args.relay_gpio,
             power_off_time=args.power_off_time,
+        )
+    elif args.command == "eeprom-dump":
+        run_eeprom_dump(
+            out_path=args.out,
+            can_interface=args.can,
+            relay_gpio=args.relay_gpio,
+            power_off_time=args.power_off_time,
+        )
+    elif args.command == "eeprom-flash":
+        run_eeprom_flash(
+            input_path=args.input,
+            driver_bin_path=args.driver_bin,
+            can_interface=args.can,
+            relay_gpio=args.relay_gpio,
+            power_off_time=args.power_off_time,
+            backup_out=args.backup_out,
+            assume_yes=args.yes,
         )
 
 
@@ -2517,31 +2824,13 @@ def run_dump_full(out_path: str, can_interface: str = "can0",
         sboot.authenticate()
         log.info("SBOOT authenticated")
 
-        # Build FM shellcode for read-only (no DRIVER needed)
-        driver_base = SHELLCODE_ADDR  # 0xD4000000 — doesn't matter for reads
-        fm_offset = 0x100  # small offset, no real DRIVER
-        fm_base = SHELLCODE_ADDR + fm_offset
-
-        dummy_fm = _build_flash_manager(driver_base, 0xD4002000, 0xD4002040,
-                                        shellcode_base=fm_base)
-        fm_size = len(dummy_fm)
-        param_offset = fm_offset + ((fm_size + 0x3F) & ~0x3F)
-        param_base = SHELLCODE_ADDR + param_offset
-        buffer_base = param_base + 0x40
-
-        flasher_code = _build_flash_manager(driver_base, param_base, buffer_base,
-                                            shellcode_base=fm_base)
-
-        # Payload: just FM shellcode at fm_offset (no real DRIVER needed for reads)
-        payload = b'\x00' * fm_offset + flasher_code
-        payload = payload.ljust(param_offset + 0x40, b'\x00')
-
-        log.info(f"Flash Manager: {len(flasher_code)} bytes at 0x{fm_base:08X}")
+        payload, fm_base = _build_flash_manager_payload()
         log.info(f"Uploading {len(payload)} bytes to PSPR...")
 
         sboot.upload_and_execute(payload, address=SHELLCODE_ADDR,
                                   execute_address=fm_base)
         time.sleep(0.5)
+        can.drain()
 
         fm = FlashManagerClient(can, timeout=2.0)
         resp = fm.ping()

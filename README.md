@@ -1,155 +1,293 @@
 # DQ250 MQB Bench Flash Tool
 
-Bench flashing tool for DQ250 MQB DSG transmission control units (TCU) over CAN.
+Bench flashing and raw memory dump tool for DQ250 MQB DSG transmission
+control units (TCUs) over CAN.
 
-Exploits a weakness in SBOOT (Bleichenbacher RSA e=3 forge) to flash the TCU directly on the bench without OEM diagnostic software.
+The tool holds the TCU in SBOOT, authenticates through a weak RSA-1024
+verification implementation, uploads a small TriCore Flash Manager, and then
+reads or programs PFlash and DFlash directly.
 
-Credits: [bri3d](https://github.com/bri3d) for the exploit and hints.
+Credits: [bri3d](https://github.com/bri3d) for the exploit and research hints.
+
+## Important: entering SBOOT
+
+The SBOOT window immediately after power-on is very short.
+
+For a manual start:
+
+1. Connect permanent 12 V, ground, CAN-H and CAN-L to the TCU.
+2. Leave ignition/switched positive (`Zündungsplus`, terminal 15) disconnected.
+3. Start the desired command.
+4. When the tool displays `Power cycle the ECU now, then press ENTER...`,
+   connect ignition positive and press `ENTER` immediately.
+
+Connecting ignition positive and pressing `ENTER` must happen very quickly.
+If the timing is missed, disconnect ignition positive and try again. A relay
+controlled through `--relay-gpio` is strongly recommended because it performs
+the power cycle with repeatable timing.
+
+Use a suitable relay module or driver stage. Do not power the TCU or a bare
+relay coil directly from a Raspberry Pi GPIO.
 
 ## Requirements
 
-- Linux with SocketCAN (`can0`)
-- Python 3.10+
-- `gmpy2` (`pip install gmpy2`)
-- CAN interface (e.g. PCAN-USB, Kvaser, MCP2515)
-- DQ250 MQB TCU on bench (12V supply, CAN-H/CAN-L)
+- Linux with SocketCAN
+- Python 3.10 or newer
+- `gmpy2`
+- CAN interface configured as `can0` by default
+- Bench-connected DQ250 MQB TCU
+- Stable 12 V power supply and a common ground between TCU and CAN interface
 
-## Process
-
-### 1. Holding SBOOT session
-
-On power-up the TCU goes through: SBOOT → CBOOT → ASW. By spamming CAN frames on `0x640` during the boot window, SBOOT is kept in its main loop and never jumps to CBOOT/ASW.
-
-### 2. SBOOT authentication
-
-SBOOT implements a phase-gated UDS-like protocol:
-
-| Phase | Service | Description |
-|-------|---------|------------|
-| 1→2 | `1A 8F` | Set internal flag |
-| 2→3 | `1A 8A` | Read data |
-| 3→4 | `1A 8B` | Unlock SA |
-| 4→6 | `27 FD/FE` | RSA-1024 authentication (Bleichenbacher forge, e=3) |
-
-SBOOT's RSA verification has two flaws:
-- Padding bytes are only checked for `!= 0x00` (not `== 0xFF`)
-- Nothing is verified after the hash (trailing garbage ignored)
-
-With e=3, a valid signature can be computed via cube root (~2-5 seconds).
-
-### 3. Shellcode upload
-
-After authentication, a **Flash Manager** is uploaded as TriCore shellcode to PSPR RAM (`0xD4000000`):
-
-| Offset | Content | Size |
-|--------|---------|------|
-| `0x000` | DRIVER block (erase/write/verify routines from bin) | ~2 KB |
-| `0x900` | Flash Manager (CAN command loop) | ~1.1 KB |
-| after FM | Param struct + data buffer | remainder |
-
-The upload is also signed via Bleichenbacher forge (second RSA key for code verification).
-
-### 4. Flash Manager protocol
-
-The Flash Manager runs as a polling loop in PSPR and communicates via raw CAN frames (no ISO-TP):
-
-| Cmd | ID | Description | Response |
-|-----|----|------------|----------|
-| `0x01` | PING | Alive check | `0x41` + "DQ250" |
-| `0x02` | READ | Read flash (4 bytes/frame) | `0x42` + data |
-| `0x03` | ERASE | Erase flash sector | `0x43` + status |
-| `0x04` | WRITE_START | Set write target (addr + len) | `0x44` |
-| `0x05` | WRITE_DATA | Stream data (4 bytes/frame) | `0x45` (every 64 frames) |
-| `0x06` | VERIFY | Verification (already done during write) | `0x46` |
-| `0x07` | FLASH_RESET | Reset flash state machine | `0x47` |
-| `0xFF` | RESET | Write warm boot magic + application reset | — |
-
-Addresses and lengths are transmitted as little-endian in CAN frames.
-
-### 5. Flashing
-
-For each block (ASW, CAL):
-1. **Erase** — Erase all affected sectors (DRIVER `0x204`)
-2. **Write** — Write data page-by-page (256 bytes) with verify (DRIVER `0x334`)
-3. **Verify** — Confirmation
-
-### 6. Reset
-
-The RESET command writes CBOOT warm boot magic to DSPR:
-- `0xD000DFFC` = `0x5353015B`
-- `0xD000DFF8` = `0xACACFEA4`
-- `0xD000DFF4` = `0x25A5A5A2` (programming complete)
-
-Then triggers an application reset via `SCU_RSTCON`. CBOOT recognizes the magic, validates CRC, clears sticky NVM error flags, and boots the new ASW.
-
-## Binary format
-
-Expects a 1.5 MB (0x180000) binary with the following layout:
-
-| Block | Offset | Size | Flash address |
-|-------|--------|------|---------------|
-| DRIVER | `0x00000` | 0x80E | — (RAM only) |
-| CAL | `0x30000` | 0x20000 | `0xA0020000` |
-| ASW | `0x50000` | 0x130000 | `0xA0040000` |
-
-ASW and CAL must have valid JAMCRC checksums in the last 4 bytes (SBOOT checks on every boot).
-
-## Usage
-
-### Flashing
+On Raspberry Pi OS, the software dependencies can be installed with:
 
 ```bash
-# Flash all blocks (relay on GPIO 17 for power cycle)
-python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --blocks ASW CAL --relay-gpio 17
-
-# Manual power cycle (no relay)
-python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --blocks ASW CAL
-
-# PING test only (no flash)
-python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --ping-only
-
-# Read flash memory
-python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --ping-only --read-addr 0xA0020000 --read-len 512
-
-# Verbose output
-python3 dq250_bench_flash.py flash --bin 0D9300042M.bin --blocks ASW CAL -v
+sudo apt update
+sudo apt install can-utils python3-gmpy2 net-tools
 ```
 
-### Full dump
+## Raspberry Pi with Waveshare 2-CH CAN FD HAT
+
+The Waveshare 2-CH CAN FD HAT uses two MCP251xFD-compatible CAN controllers
+connected through SPI.
+
+### 1. Enable SPI
+
+Run:
 
 ```bash
-# Dump entire PFlash (1.5 MB)
-python3 dq250_bench_flash.py dump --out pflash_dump.bin --relay-gpio 17
+sudo raspi-config
 ```
 
-### Options
+Enable SPI under **Interface Options**, then exit `raspi-config`.
+
+### 2. Configure the overlays
+
+Add the following lines to `/boot/firmware/config.txt`:
+
+```ini
+dtparam=spi=on
+dtoverlay=spi1-3cs
+dtoverlay=mcp251xfd,spi0-0,interrupt=25
+dtoverlay=mcp251xfd,spi1-0,interrupt=24
+```
+
+Reboot the Raspberry Pi:
+
+```bash
+sudo reboot
+```
+
+### 3. Bring up CAN
+
+Run these commands after every reboot:
+
+```bash
+sudo ip link set can0 up type can bitrate 500000
+sudo ifconfig can0 txqueuelen 65536
+```
+
+The queue length can alternatively be set with the modern `ip` command:
+
+```bash
+sudo ip link set can0 txqueuelen 65536
+```
+
+Check the interface:
+
+```bash
+ip -details link show can0
+```
+
+To use the HAT's second channel, bring up `can1` in the same way and pass
+`--can can1` to the tool.
+
+## Quick start
+
+All examples use a relay connected to GPIO 17. Remove `--relay-gpio 17` to
+use the manual ignition-positive sequence described above.
+
+### Flash ASW and CAL
+
+```bash
+python3 dq250_bench_flash.py flash \
+  --bin 0D9300042M.bin \
+  --blocks ASW CAL \
+  --relay-gpio 17
+```
+
+### Dump PFlash
+
+```bash
+python3 dq250_bench_flash.py dump \
+  --out pflash_dump.bin \
+  --relay-gpio 17
+```
+
+### Dump EEPROM
+
+```bash
+python3 dq250_bench_flash.py eeprom-dump \
+  --out eeprom.bin \
+  --relay-gpio 17
+```
+
+### Flash EEPROM
+
+```bash
+python3 dq250_bench_flash.py eeprom-flash \
+  --in eeprom.bin \
+  --driver-bin 0D9300042M.bin \
+  --backup-out eeprom-before-flash.bin \
+  --relay-gpio 17
+```
+
+`eeprom-flash` asks you to type `FLASH` before continuing. Use `--yes` only
+when the command is being run unattended and the input file has already been
+checked.
+
+## Additional commands
+
+### Test SBOOT authentication and Flash Manager upload
+
+```bash
+python3 dq250_bench_flash.py flash \
+  --bin 0D9300042M.bin \
+  --ping-only
+```
+
+### Read an arbitrary address
+
+```bash
+python3 dq250_bench_flash.py flash \
+  --bin 0D9300042M.bin \
+  --ping-only \
+  --read-addr 0xA0020000 \
+  --read-len 512
+```
+
+### Use another CAN interface
+
+```bash
+python3 dq250_bench_flash.py eeprom-dump \
+  --out eeprom.bin \
+  --can can1 \
+  --relay-gpio 17
+```
+
+Add `-v` or `--verbose` to any command for detailed logging.
+
+## EEPROM / DFlash format
+
+The TC1766 contains two separately erasable 16 KB DFlash banks. EEPROM dumps
+are stored as one raw 32 KB file with bank 0 followed directly by bank 1:
+
+| File offset | Size | TCU address |
+|-------------|------|-------------|
+| `0x0000` | 16 KB | `0xAFE00000` (bank 0) |
+| `0x4000` | 16 KB | `0xAFE10000` (bank 1) |
+
+EEPROM flashing uses the DFlash support in the firmware's DRIVER block:
+
+- both 16 KB banks are read before erasing;
+- `--backup-out` saves that pre-flash read;
+- an identical input is not rewritten, avoiding unnecessary DFlash wear;
+- each bank is erased separately;
+- data is programmed in 128-byte pages;
+- the complete EEPROM is read back and compared byte-for-byte.
+
+`--driver-bin` must point to a compatible 1.5 MB DQ250 firmware binary. The
+tool checks the DRIVER entry-point layout before allowing an erase.
+
+## PFlash binary format
+
+The `flash` command expects a 1.5 MB (`0x180000`) binary:
+
+| Block | File offset | Size | Flash address |
+|-------|-------------|------|---------------|
+| DRIVER | `0x00000` | `0x80E` | RAM only |
+| CAL | `0x30000` | `0x20000` | `0xA0020000` |
+| ASW | `0x50000` | `0x130000` | `0xA0040000` |
+
+ASW and CAL must contain valid JAMCRC checksums in their final four bytes.
+SBOOT checks these checksums on every boot.
+
+## Command options
+
+### Common options
 
 | Option | Description |
-|--------|------------|
-| `--bin` | DQ250 binary file (1.5 MB) |
-| `--blocks` | Blocks to flash: `ASW`, `CAL` (default: all) |
-| `--can` | CAN interface (default: `can0`) |
-| `--relay-gpio` | GPIO pin for relay power cycle |
-| `--ping-only` | SBOOT auth + PING only, no flash |
-| `--read-addr` | Address to read (hex) |
-| `--read-len` | Bytes to read (default: 256) |
-| `--skip-erase` | Skip erase step (when flash is already erased) |
-| `-v` | Verbose/debug output |
+|--------|-------------|
+| `--can` | SocketCAN interface; default: `can0` |
+| `--relay-gpio` | GPIO controlling the automatic power-cycle relay |
+| `--power-off-time` | Relay power-off duration in seconds; default: `2.0` |
+| `-v`, `--verbose` | Enable detailed logging |
 
-## Hardware
+### PFlash options
 
-### TC1766 (TriCore)
+| Option | Description |
+|--------|-------------|
+| `--bin` | DQ250 1.5 MB firmware binary |
+| `--blocks` | Blocks to flash: `ASW`, `CAL` or `DRIVER` |
+| `--ping-only` | Authenticate and upload the Flash Manager without flashing |
+| `--read-addr` | Address to read, for example `0xA0020000` |
+| `--read-len` | Number of bytes to read; default: `256` |
+| `--skip-erase` | Skip PFlash erase; use only when the flash is already erased |
 
-- PFlash0: `0xA0000000` – `0xA00FFFFF` (1 MB)
-- PFlash1: `0xA0100000` – `0xA016FFFF` (448 KB used)
-- PSPR RAM: `0xD4000000` – `0xD4003FFF` (16 KB) — shellcode target
-- DSPR RAM: `0xD0000000` – `0xD000FFFF` (64 KB)
+### EEPROM options
+
+| Option | Description |
+|--------|-------------|
+| `--in` | Raw 32 KB EEPROM image to flash |
+| `--out` | EEPROM dump output path |
+| `--driver-bin` | Compatible 1.5 MB binary supplying the DRIVER |
+| `--backup-out` | Save the current EEPROM before erasing |
+| `--yes` | Skip the `FLASH` confirmation prompt |
+
+## How it works
+
+### SBOOT hold and authentication
+
+On power-up the TCU normally runs SBOOT → CBOOT → ASW. Repeated requests on
+CAN ID `0x640` keep SBOOT in its command loop. The tool then advances through
+the internal authentication phases and forges the required RSA signatures by
+exploiting SBOOT's relaxed PKCS#1 v1.5 verification.
+
+### Flash Manager upload
+
+The tool uploads TriCore code to PSPR RAM at `0xD4000000`. For write
+operations, the payload includes the firmware's DRIVER routines. The Flash
+Manager then communicates through raw eight-byte CAN frames:
+
+| Command | ID | Description | Response |
+|---------|----|-------------|----------|
+| PING | `0x01` | Alive check | `0x41` + `DQ250` |
+| READ | `0x02` | Read four bytes per frame | `0x42` + data |
+| ERASE | `0x03` | Erase one flash sector | `0x43` + status |
+| WRITE_START | `0x04` | Set target address and length | `0x44` |
+| WRITE_DATA | `0x05` | Stream four data bytes per frame | `0x45` |
+| VERIFY | `0x06` | Return write verification state | `0x46` |
+| FLASH_RESET | `0x07` | Reset the flash state machine | `0x47` |
+| RESET | `0xFF` | Set warm-boot state and reset the TCU | none |
+
+After a PFlash operation, the reset command writes the CBOOT warm-boot magic,
+triggers an application reset, and allows the validated ASW to start.
+
+## Hardware reference
+
+### TC1766 memory
+
+- PFlash0: `0xA0000000`–`0xA00FFFFF`
+- PFlash1 used range: `0xA0100000`–`0xA016FFFF`
+- DFlash bank 0: `0xAFE00000`–`0xAFE03FFF`
+- DFlash bank 1: `0xAFE10000`–`0xAFE13FFF`
+- PSPR RAM: `0xD4000000`–`0xD4003FFF`
+- DSPR RAM: `0xD0000000`–`0xD000FFFF`
 
 ### CAN IDs
 
 | ID | Direction | Description |
-|----|-----------|------------|
-| `0x640` | Host → TCU | SBOOT/FM requests |
-| `0x641` | TCU → Host | SBOOT/FM responses |
-| `0x7E1` | Host → TCU | CBOOT UDS (standard) |
+|----|-----------|-------------|
+| `0x640` | Host → TCU | SBOOT and Flash Manager request |
+| `0x641` | TCU → Host | SBOOT and Flash Manager response |
+| `0x7E1` | Host → TCU | CBOOT UDS request |
 | `0x7E9` | TCU → Host | CBOOT UDS response |
