@@ -88,17 +88,25 @@ WORKSHOP_CODE = bytes([0x20, 0x4, 0x20, 0x42, 0x04, 0x20, 0x42, 0xB1, 0x3D])
 # Also valid: 0xD0000000-0xD0000FFF (4KB only)
 SHELLCODE_ADDR = 0xD4000000
 
-# TC1766 DFlash / EEPROM layout.
+# TC1766 internal DFlash layout.
 #
 # The device has two separately erasable 16KB DFlash banks.  They are not
-# contiguous in the address map, so EEPROM files store bank 0 followed by
-# bank 1 without the address-space gap.
+# contiguous in the address map, so raw DFlash files store bank 0 followed by
+# bank 1 without the address-space gap.  This is not the external serial
+# EEPROM used by the DQ250 application.
 DFLASH_BANKS = (
     (0xAFE00000, 0x4000),
     (0xAFE10000, 0x4000),
 )
 DFLASH_PAGE_SIZE = 0x80
-EEPROM_SIZE = sum(size for _, size in DFLASH_BANKS)
+DFLASH_SIZE = sum(size for _, size in DFLASH_BANKS)
+
+# DQ250 application NVM is an external SPI EEPROM on SSC0.  The application
+# mirrors 0xC00 bytes at D000B000, while bench tools conventionally preserve
+# the complete 8KB device image.
+EEPROM_APP_SIZE = 0x0C00
+EEPROM_SIZE = 0x2000
+EEPROM_READ_CHUNK = 0x100
 
 
 def jamcrc(data: bytes) -> int:
@@ -1169,6 +1177,7 @@ FM_CMD_WRITE_START = 0x04
 FM_CMD_WRITE_DATA = 0x05
 FM_CMD_VERIFY = 0x06
 FM_CMD_FLASH_RESET = 0x07
+FM_CMD_EEPROM_READ = 0x08
 FM_CMD_RESET = 0xFF
 
 # ACK interval for streaming write (every N frames)
@@ -1408,6 +1417,15 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_load32(5, 0xDEADDEAD)       # patched later
     sc += _tc_rlc(0xCD, 0, 0xFE24, 5)     # MTCR BTV, d5
     sc += bytes([0x0D, 0x00, 0xC0, 0x04])  # ISYNC
+
+    # Enable SSC0 while ENDINIT is clear.  These values match the DQ250
+    # application initialization in FUN_800961c0.
+    sc += _tc_load_addr(2, 0xF0100100)     # a2 = SSC0 base
+    sc += _tc_mov_d(5, 0)
+    sc += _tc_st_w(2, 0x00, 5)            # SSC0_CLC = 0
+    sc += _tc_load32(5, 0x0000826D)
+    sc += _tc_st_w(2, 0x0C, 5)            # SSC0_FDR = 0x826D
+
     # Re-lock ENDINIT
     sc += _tc_mov_u(5, 0xFF01)
     sc += _tc_addih(5, 5, 0xFFFF)
@@ -1425,6 +1443,54 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     sc += _tc_or_imm(15, 15, 0x3)         # LCK=1, ENDINIT=1
     sc += _tc_st_w(6, 0, 15)
     sc += bytes([0x0D, 0x00, 0xC0, 0x04])
+
+    # Configure the SSC0 pins exactly as the application does.  P2.8 is the
+    # external EEPROM chip select; keep it deasserted until a transaction.
+    sc += _tc_load_addr(2, 0xF0000F00)     # Port 3
+    sc += _tc_ld_w(5, 2, 0x14)
+    sc += _tc_load32(7, 0xFFFFFF0F)
+    sc += _tc_and(5, 5, 7)
+    sc += _tc_or_imm(5, 5, 0x90)
+    sc += _tc_st_w(2, 0x14, 5)
+    sc += _tc_ld_w(5, 2, 0x10)
+    sc += _tc_load32(7, 0x0F0FFFFF)
+    sc += _tc_and(5, 5, 7)
+    sc += _tc_load32(7, 0x20900000)
+    sc += _tc_or_rr(5, 5, 7)
+    sc += _tc_st_w(2, 0x10, 5)
+
+    sc += _tc_load_addr(2, 0xF0000E00)     # Port 2
+    sc += _tc_load32(5, 0x00000100)
+    sc += _tc_st_w(2, 0x04, 5)            # P2.8 high (EEPROM CS inactive)
+    sc += _tc_ld_w(5, 2, 0x1C)
+    sc += _tc_load32(7, 0xFFFFFF0F)
+    sc += _tc_and(5, 5, 7)
+    sc += _tc_or_imm(5, 5, 0x90)
+    sc += _tc_st_w(2, 0x1C, 5)
+    sc += _tc_ld_w(5, 2, 0x10)
+    sc += _tc_load32(7, 0xFFFF0FFF)
+    sc += _tc_and(5, 5, 7)
+    sc += _tc_load32(7, 0x00008000)
+    sc += _tc_or_rr(5, 5, 7)
+    sc += _tc_st_w(2, 0x10, 5)
+    sc += _tc_ld_w(5, 2, 0x18)
+    sc += _tc_load32(7, 0x0F0F0F0F)
+    sc += _tc_and(5, 5, 7)
+    sc += _tc_load32(7, 0x90008080)
+    sc += _tc_or_rr(5, 5, 7)
+    sc += _tc_st_w(2, 0x18, 5)
+
+    # Receive interrupt stays disabled; the EEPROM handler polls SRR instead.
+    sc += _tc_load_addr(2, 0xF0100100)
+    sc += _tc_mov_d(5, 0)
+    sc += _tc_st_w(2, 0x04, 5)            # SSC0_PISEL = input path A
+    sc += _tc_load32(5, 0x00004000)
+    sc += _tc_st_w(2, 0xF4, 5)            # disable/clear TX request
+    sc += _tc_st_w(2, 0xFC, 5)            # disable/clear error request
+    sc += _tc_load32(5, 0x0000400B)
+    sc += _tc_st_w(2, 0xF8, 5)            # SSC0_RSRC: clear pending, SRE=0
+    sc += _tc_load32(5, 0x00000F00)
+    sc += _tc_st_w(2, 0x2C, 5)            # SSC0_EF
 
     # ===================================================================
     # MAIN LOOP: Service WDT, then poll RX MO for new data
@@ -1881,6 +1947,136 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     fr_skip = (fr_end - fr_jne_pos) // 2
     sc[fr_jne_pos:fr_jne_pos + 4] = _tc_jne(2, FM_CMD_FLASH_RESET, fr_skip)
 
+    # --- Check external EEPROM READ (0x08) ---
+    #
+    # The DQ250 application uses an SPI EEPROM on SSC0, not the TC1766's
+    # internal DFlash.  Protocol:
+    #   TX  [08, address_lo, address_hi, length_lo, length_hi, 0, 0, 0]
+    #   RX  [48, sequence, remaining_lo, remaining_hi, D0, D1, D2, D3]
+    # BRC const4 is signed, so command 0x08 cannot be compared directly.
+    sc += _tc_addi(5, 2, -FM_CMD_EEPROM_READ & 0xFFFF)
+    ee_read_jne_pos = len(sc)
+    sc += _tc_jne(5, 0, 0)
+
+    # Address in d3, length in d4.
+    sc += _tc_sh(3, 0, 0x1F8)             # d3 = d0 >> 8
+    sc += _tc_mov_u(5, 0xFFFF)
+    sc += _tc_and(3, 3, 5)
+    sc += _tc_sh(4, 0, 0x1E8)             # d4 = d0 >> 24
+    sc += _tc_and_imm(5, 1, 0xFF)
+    sc += _tc_sh(5, 5, 8)
+    sc += _tc_or_rr(4, 4, 5)              # d4 = 16-bit length
+
+    # SSC0: 8-bit, MSB first, application clock/mode.  Keep RIR disabled and
+    # poll its service-request flag after every byte.
+    sc += _tc_load_addr(5, 0xF0100100)     # a5 = SSC0 base
+    sc += _tc_load32(5, 9)
+    sc += _tc_st_w(5, 0x14, 5)            # BR = 9
+    sc += _tc_load32(5, 0x00000F00)
+    sc += _tc_st_w(5, 0x2C, 5)            # EF = 0xF00
+    sc += _tc_load32(5, 0x0000C2B7)
+    sc += _tc_st_w(5, 0x10, 5)            # CON from application config #1
+    sc += _tc_load32(5, 0x0000400B)
+    sc += _tc_st_w(5, 0xF8, 5)            # clear pending receive request
+
+    # Assert the manually controlled EEPROM CS (P2.8 low).
+    sc += _tc_load_addr(2, 0xF0000E00)
+    sc += _tc_load32(5, 0x01000000)
+    sc += _tc_st_w(2, 0x04, 5)
+
+    def _emit_ssc_xfer(tx_d: int, rx_d: int):
+        """Emit one polling SSC0 byte transfer (a5=SSC0, d6=SRR mask)."""
+        sc.extend(_tc_st_w(5, 0x20, tx_d))
+        poll = len(sc)
+        sc.extend(_tc_ld_w(5, 5, 0xF8))
+        sc.extend(_tc_and(5, 5, 6))
+        branch = len(sc)
+        sc.extend(_tc_jeq(5, 0, (poll - branch) // 2))
+        sc.extend(_tc_ld_w(rx_d, 5, 0x24))
+        sc.extend(_tc_load32(5, 0x0000400B))
+        sc.extend(_tc_st_w(5, 0xF8, 5))
+
+    # READ opcode + 16-bit big-endian address.
+    sc += _tc_load32(6, 0x00002000)
+    sc += _tc_mov_d(7, 3)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_sh(7, 3, 0x1F8)
+    sc += _tc_and_imm(7, 7, 0xFF)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_and_imm(7, 3, 0xFF)
+    _emit_ssc_xfer(7, 7)
+
+    sc += _tc_mov_d(14, 0)                 # response sequence
+    ee_loop = len(sc)
+    ee_done_jeq = len(sc)
+    sc += _tc_jeq(4, 0, 0)
+
+    # Read and pack four EEPROM bytes into MODATAH.
+    sc += _tc_load32(6, 0x00002000)
+    sc += _tc_mov_d(7, 0)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_and_imm(0, 7, 0xFF)
+    sc += _tc_mov_d(7, 0)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_and_imm(7, 7, 0xFF)
+    sc += _tc_sh(7, 7, 8)
+    sc += _tc_or_rr(0, 0, 7)
+    sc += _tc_mov_d(7, 0)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_and_imm(7, 7, 0xFF)
+    sc += _tc_sh(7, 7, 16)
+    sc += _tc_or_rr(0, 0, 7)
+    sc += _tc_mov_d(7, 0)
+    _emit_ssc_xfer(7, 7)
+    sc += _tc_and_imm(7, 7, 0xFF)
+    sc += _tc_sh(7, 7, 24)
+    sc += _tc_or_rr(0, 0, 7)
+
+    # Stream the packed bytes over CAN.
+    sc += _tc_mov_u(5, 0x0048)
+    sc += _tc_sh(6, 14, 8)
+    sc += _tc_or_rr(5, 5, 6)
+    sc += _tc_sh(6, 4, 16)
+    sc += _tc_or_rr(5, 5, 6)
+    sc += _tc_st_w(9, MO_MODATAL, 5)
+    sc += _tc_st_w(9, MO_MODATAH, 0)
+    sc += _tc_load32(5, MOCTR_SETTXRQ | MOCTR_SETNEWDAT)
+    sc += _tc_st_w(9, MO_MOCTR, 5)
+
+    ee_tx_poll = len(sc)
+    sc += _tc_ld_w(5, 9, MO_MOSTAT)
+    sc += _tc_and_imm(6, 5, MOSTAT_TXPND)
+    ee_tx_branch = len(sc)
+    sc += _tc_jeq(6, 0, (ee_tx_poll - ee_tx_branch) // 2)
+    sc += _tc_load32(5, MOCTR_RESTXPND)
+    sc += _tc_st_w(9, MO_MOCTR, 5)
+
+    sc += _tc_addi(4, 4, -4 & 0xFFFF)
+    sc += _tc_addi(14, 14, 1)
+    ee_loop_branch = len(sc)
+    sc += _tc_jne(4, 0, (ee_loop - ee_loop_branch) // 2)
+
+    ee_done = len(sc)
+    sc[ee_done_jeq:ee_done_jeq + 4] = _tc_jeq(
+        4, 0, (ee_done - ee_done_jeq) // 2
+    )
+
+    # Deassert CS and disable the SSC transfer engine.
+    sc += _tc_load_addr(2, 0xF0000E00)
+    sc += _tc_load32(5, 0x00000100)
+    sc += _tc_st_w(2, 0x04, 5)            # P2.8 high
+    sc += _tc_ld_w(5, 5, 0x10)
+    sc += _tc_load32(6, 0xFFFF7FFF)
+    sc += _tc_and(5, 5, 6)
+    sc += _tc_st_w(5, 0x10, 5)
+    ee_main_jmp = len(sc)
+    sc += _tc_j(0)
+
+    ee_read_end = len(sc)
+    sc[ee_read_jne_pos:ee_read_jne_pos + 4] = _tc_jne(
+        5, 0, (ee_read_end - ee_read_jne_pos) // 2
+    )
+
     # --- Check RESET (0xFF) — doesn't fit in const4, use ADDI + JNE ---
     sc += _tc_addi(5, 2, -0xFF & 0xFFFF)
     reset_jne_pos = len(sc)
@@ -2030,6 +2226,7 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     # Jumps to main_loop
     _patch_j32(j_main_from_read, main_loop)
     _patch_j32(wd_not_done_main, main_loop)
+    _patch_j32(ee_main_jmp, main_loop)
     _patch_j32(unknown_j, main_loop)
 
     log.debug(f"Flash Manager shellcode: {len(sc)} bytes")
@@ -2135,6 +2332,35 @@ class FlashManagerClient:
             result.extend(chunk[:take])
             remaining -= take
 
+        return bytes(result)
+
+    def read_eeprom(self, address: int, length: int) -> bytes:
+        """Read the external SPI EEPROM through the Flash Manager."""
+        if not 0 <= address <= 0xFFFF:
+            raise ValueError(f"EEPROM address out of range: 0x{address:x}")
+        if length <= 0 or length > 0xFFFF or length % 4:
+            raise ValueError("EEPROM read length must be 4..65532 and divisible by 4")
+        if address + length > 0x10000:
+            raise ValueError("EEPROM read crosses the 16-bit address limit")
+
+        cmd = struct.pack("<BHH", FM_CMD_EEPROM_READ, address, length)
+        self.can.send_frame(SBOOT_TXID, cmd.ljust(8, b"\x00"))
+
+        result = bytearray()
+        remaining = length
+        while remaining:
+            resp = self.can.recv_frame_filtered(SBOOT_RXID, timeout=self.timeout)
+            if resp is None:
+                raise TimeoutError(
+                    f"EEPROM READ: timeout at offset 0x{length - remaining:x}"
+                )
+            if resp[0] != 0x48:
+                raise RuntimeError(
+                    f"EEPROM READ: unexpected response {resp.hex()}"
+                )
+            take = min(4, remaining)
+            result.extend(resp[4:4 + take])
+            remaining -= take
         return bytes(result)
 
     def erase_sector(self, address: int, length: int) -> int:
@@ -2462,8 +2688,8 @@ def run_flash_direct(
         can.close()
 
 
-def _read_eeprom(fm: FlashManagerClient, chunk_size: int = 0x100) -> bytes:
-    """Read both non-contiguous DFlash banks into one contiguous EEPROM image."""
+def _read_dflash(fm: FlashManagerClient, chunk_size: int = 0x100) -> bytes:
+    """Read both non-contiguous internal DFlash banks into one raw image."""
     image = bytearray()
     total_read = 0
     for bank_index, (bank_addr, bank_size) in enumerate(DFLASH_BANKS):
@@ -2477,9 +2703,31 @@ def _read_eeprom(fm: FlashManagerClient, chunk_size: int = 0x100) -> bytes:
             total_read += length
             if offset % 0x1000 == 0:
                 log.info(
-                    f"  EEPROM read: {100 * total_read // EEPROM_SIZE}% "
+                    f"  DFlash read: {100 * total_read // DFLASH_SIZE}% "
                     f"(0x{bank_addr + offset:08X})"
                 )
+    return bytes(image)
+
+
+def _read_eeprom(
+    fm: FlashManagerClient,
+    size: int = EEPROM_SIZE,
+    chunk_size: int = EEPROM_READ_CHUNK,
+) -> bytes:
+    """Read the external serial EEPROM through SSC0."""
+    if size <= 0 or size > 0x10000 or size % 4:
+        raise ValueError("EEPROM size must be 4..65536 and divisible by 4")
+    if chunk_size <= 0 or chunk_size > 0xFFFF or chunk_size % 4:
+        raise ValueError("EEPROM chunk size must be divisible by 4")
+
+    image = bytearray()
+    for offset in range(0, size, chunk_size):
+        length = min(chunk_size, size - offset)
+        image.extend(fm.read_eeprom(offset, length))
+        log.info(
+            f"  EEPROM read: {100 * len(image) // size}% "
+            f"(0x{offset:04X}-0x{offset + length - 1:04X})"
+        )
     return bytes(image)
 
 
@@ -2519,14 +2767,15 @@ def run_eeprom_dump(
     can_interface: str = "can0",
     relay_gpio: int | None = None,
     power_off_time: float = 2.0,
+    size: int = EEPROM_SIZE,
 ):
-    """Dump both TC1766 DFlash banks to one 32KB raw EEPROM file."""
+    """Dump the DQ250 external SPI EEPROM."""
     payload, execute_address = _build_flash_manager_payload()
 
     print("\n" + "=" * 60)
-    print("  DQ250 EEPROM / DFlash Dump")
-    print(f"  Banks:   0x{DFLASH_BANKS[0][0]:08X}, 0x{DFLASH_BANKS[1][0]:08X}")
-    print(f"  Size:    0x{EEPROM_SIZE:X} ({EEPROM_SIZE // 1024} KB)")
+    print("  DQ250 External EEPROM Dump")
+    print("  Bus:     TC1766 SSC0 / SPI")
+    print(f"  Size:    0x{size:X} ({size // 1024} KB)")
     print(f"  Output:  {out_path}")
     print(f"  CAN:     {can_interface}")
     print("=" * 60 + "\n")
@@ -2536,10 +2785,18 @@ def run_eeprom_dump(
         fm = _start_flash_manager(
             can, payload, execute_address, relay_gpio, power_off_time
         )
-        image = _read_eeprom(fm)
-        if len(image) != EEPROM_SIZE:
+        image = _read_eeprom(fm, size=size)
+        if len(image) != size:
             raise RuntimeError(
-                f"EEPROM dump has 0x{len(image):x} bytes, expected 0x{EEPROM_SIZE:x}"
+                f"EEPROM dump has 0x{len(image):x} bytes, expected 0x{size:x}"
+            )
+        if image == b"\x00" * size:
+            raise RuntimeError(
+                "external EEPROM read returned only 0x00; no file was written"
+            )
+        if image == b"\xFF" * size:
+            raise RuntimeError(
+                "external EEPROM read returned only 0xFF; no file was written"
             )
         pathlib.Path(out_path).write_bytes(image)
         log.info(f"Saved EEPROM dump to {out_path}")
@@ -2552,7 +2809,53 @@ def run_eeprom_dump(
         can.close()
 
 
-def run_eeprom_flash(
+def run_eeprom_flash(*_args, **_kwargs):
+    """Refuse writes until the external EEPROM reader is hardware-validated."""
+    raise RuntimeError(
+        "external EEPROM flashing is temporarily disabled: validate a non-empty "
+        "eeprom-dump first; the old implementation targeted internal DFlash"
+    )
+
+
+def run_dflash_dump(
+    out_path: str,
+    can_interface: str = "can0",
+    relay_gpio: int | None = None,
+    power_off_time: float = 2.0,
+):
+    """Dump both TC1766 internal DFlash banks to one 32KB raw file."""
+    payload, execute_address = _build_flash_manager_payload()
+
+    print("\n" + "=" * 60)
+    print("  TC1766 Internal DFlash Dump")
+    print(f"  Banks:   0x{DFLASH_BANKS[0][0]:08X}, 0x{DFLASH_BANKS[1][0]:08X}")
+    print(f"  Size:    0x{DFLASH_SIZE:X} ({DFLASH_SIZE // 1024} KB)")
+    print(f"  Output:  {out_path}")
+    print(f"  CAN:     {can_interface}")
+    print("=" * 60 + "\n")
+
+    can = RawCAN(can_interface)
+    try:
+        fm = _start_flash_manager(
+            can, payload, execute_address, relay_gpio, power_off_time
+        )
+        image = _read_dflash(fm)
+        if len(image) != DFLASH_SIZE:
+            raise RuntimeError(
+                f"DFlash dump has 0x{len(image):x} bytes, expected 0x{DFLASH_SIZE:x}"
+            )
+        pathlib.Path(out_path).write_bytes(image)
+        log.info(f"Saved internal DFlash dump to {out_path}")
+        fm.reset()
+        print(f"\n  DFlash dump complete: {out_path} ({len(image)} bytes)")
+    except Exception as exc:
+        log.error(f"DFlash dump failed: {exc}")
+        raise
+    finally:
+        can.close()
+
+
+def run_dflash_flash(
     input_path: str,
     driver_bin_path: str,
     can_interface: str = "can0",
@@ -2563,10 +2866,10 @@ def run_eeprom_flash(
 ):
     """Erase, program, and read-back verify both TC1766 DFlash banks."""
     image = pathlib.Path(input_path).read_bytes()
-    if len(image) != EEPROM_SIZE:
+    if len(image) != DFLASH_SIZE:
         raise ValueError(
-            f"EEPROM image must be exactly 0x{EEPROM_SIZE:x} bytes "
-            f"({EEPROM_SIZE // 1024} KB), got 0x{len(image):x}"
+            f"DFlash image must be exactly 0x{DFLASH_SIZE:x} bytes "
+            f"({DFLASH_SIZE // 1024} KB), got 0x{len(image):x}"
         )
 
     firmware = pathlib.Path(driver_bin_path).read_bytes()
@@ -2578,17 +2881,17 @@ def run_eeprom_flash(
     payload, execute_address = _build_flash_manager_payload(driver_data)
 
     print("\n" + "=" * 60)
-    print("  DQ250 EEPROM / DFlash Flash")
+    print("  TC1766 Internal DFlash Flash")
     print(f"  Input:   {input_path}")
     print(f"  Driver:  {driver_bin_path}")
-    print(f"  Size:    0x{EEPROM_SIZE:X} ({EEPROM_SIZE // 1024} KB)")
+    print(f"  Size:    0x{DFLASH_SIZE:X} ({DFLASH_SIZE // 1024} KB)")
     print(f"  CAN:     {can_interface}")
     print("  WARNING: both 16KB DFlash banks will be erased.")
     print("=" * 60 + "\n")
     if not assume_yes:
         confirmation = input("Type FLASH to continue: ").strip()
         if confirmation != "FLASH":
-            print("EEPROM flash cancelled.")
+            print("DFlash flash cancelled.")
             return
 
     can = RawCAN(can_interface)
@@ -2599,14 +2902,14 @@ def run_eeprom_flash(
 
         # Always read before erasing.  This avoids unnecessary DFlash wear and
         # makes --backup-out a reliable pre-flash backup.
-        old_image = _read_eeprom(fm)
+        old_image = _read_dflash(fm)
         if backup_out is not None:
             pathlib.Path(backup_out).write_bytes(old_image)
-            log.info(f"Saved pre-flash EEPROM backup to {backup_out}")
+            log.info(f"Saved pre-flash DFlash backup to {backup_out}")
         if old_image == image:
-            log.info("EEPROM already matches the input; skipping erase/program")
+            log.info("DFlash already matches the input; skipping erase/program")
             fm.reset()
-            print("\n  EEPROM already matches — nothing written.")
+            print("\n  DFlash already matches — nothing written.")
             return
 
         # Each 16KB bank is one separately erasable TC1766 DFlash sector.
@@ -2630,7 +2933,7 @@ def run_eeprom_flash(
                 if offset % 0x1000 == 0:
                     written = file_offset + offset
                     log.info(
-                        f"  EEPROM write: {100 * written // EEPROM_SIZE}% "
+                        f"  DFlash write: {100 * written // DFLASH_SIZE}% "
                         f"(0x{bank_addr + offset:08X})"
                     )
                 # TC1766 erased DFlash reads as zero.  Programming zero-only
@@ -2641,13 +2944,13 @@ def run_eeprom_flash(
                 status = fm.write_data(page)
                 if status != 0:
                     raise RuntimeError(
-                        f"EEPROM write failed at 0x{bank_addr + offset:08X}: "
+                        f"DFlash write failed at 0x{bank_addr + offset:08X}: "
                         f"status={status}"
                     )
             file_offset += bank_size
 
-        log.info("Reading EEPROM back for byte-for-byte verification")
-        readback = _read_eeprom(fm)
+        log.info("Reading DFlash back for byte-for-byte verification")
+        readback = _read_dflash(fm)
         if readback != image:
             mismatch = next(
                 index
@@ -2658,18 +2961,18 @@ def run_eeprom_flash(
             bank_file_offset = sum(size for _, size in DFLASH_BANKS[:bank_index])
             address = DFLASH_BANKS[bank_index][0] + mismatch - bank_file_offset
             raise RuntimeError(
-                f"EEPROM verify mismatch at file offset 0x{mismatch:x} "
+                f"DFlash verify mismatch at file offset 0x{mismatch:x} "
                 f"(0x{address:08X}): read 0x{readback[mismatch]:02X}, "
                 f"expected 0x{image[mismatch]:02X}"
             )
 
-        log.info("EEPROM byte-for-byte verification OK")
+        log.info("DFlash byte-for-byte verification OK")
         fm.reset()
         print("\n" + "=" * 60)
-        print("  EEPROM FLASH COMPLETE — read-back verification OK")
+        print("  DFLASH COMPLETE — read-back verification OK")
         print("=" * 60 + "\n")
     except Exception as exc:
-        log.error(f"EEPROM flash failed: {exc}")
+        log.error(f"DFlash flash failed: {exc}")
         raise
     finally:
         can.close()
@@ -2689,7 +2992,8 @@ Examples:
   %(prog)s flash --bin 0D9300042M.bin --ping-only --relay-gpio 17
   %(prog)s dump --out full_pflash.bin --relay-gpio 17
   %(prog)s eeprom-dump --out eeprom.bin --relay-gpio 17
-  %(prog)s eeprom-flash --in eeprom.bin --driver-bin 0D9300042M.bin --relay-gpio 17
+  %(prog)s dflash-dump --out internal_dflash.bin --relay-gpio 17
+  %(prog)s dflash-flash --in internal_dflash.bin --driver-bin 0D9300042M.bin --relay-gpio 17
 """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2722,34 +3026,58 @@ Examples:
     p_dump.add_argument("-v", "--verbose", action="store_true")
 
     p_eeprom_dump = sub.add_parser(
-        "eeprom-dump", help="Dump both DFlash banks to a raw 32KB EEPROM image"
+        "eeprom-dump", help="Dump the external SPI EEPROM (8KB by default)"
     )
     p_eeprom_dump.add_argument("--out", required=True, help="Output EEPROM file")
+    p_eeprom_dump.add_argument(
+        "--size", type=lambda value: int(value, 0), default=EEPROM_SIZE,
+        help="Bytes to dump (default: 0x2000 / 8KB)",
+    )
     p_eeprom_dump.add_argument("--can", default="can0")
     p_eeprom_dump.add_argument("--relay-gpio", type=int)
     p_eeprom_dump.add_argument("--power-off-time", type=float, default=2.0)
     p_eeprom_dump.add_argument("-v", "--verbose", action="store_true")
 
     p_eeprom_flash = sub.add_parser(
-        "eeprom-flash", help="Flash and verify a raw 32KB EEPROM image"
+        "eeprom-flash",
+        help="External EEPROM flash (disabled until read path is validated)",
     )
     p_eeprom_flash.add_argument("--in", dest="input", required=True,
-                                help="Raw 32KB EEPROM image")
-    p_eeprom_flash.add_argument(
-        "--driver-bin", required=True,
-        help="DQ250 1.5MB binary providing the matching DRIVER block",
-    )
-    p_eeprom_flash.add_argument(
-        "--backup-out", help="Save the current EEPROM before erasing"
-    )
+                                help="Raw external EEPROM image")
     p_eeprom_flash.add_argument("--can", default="can0")
     p_eeprom_flash.add_argument("--relay-gpio", type=int)
     p_eeprom_flash.add_argument("--power-off-time", type=float, default=2.0)
-    p_eeprom_flash.add_argument(
+    p_eeprom_flash.add_argument("-v", "--verbose", action="store_true")
+
+    p_dflash_dump = sub.add_parser(
+        "dflash-dump", help="Dump both internal TC1766 DFlash banks (32KB)"
+    )
+    p_dflash_dump.add_argument("--out", required=True, help="Output DFlash file")
+    p_dflash_dump.add_argument("--can", default="can0")
+    p_dflash_dump.add_argument("--relay-gpio", type=int)
+    p_dflash_dump.add_argument("--power-off-time", type=float, default=2.0)
+    p_dflash_dump.add_argument("-v", "--verbose", action="store_true")
+
+    p_dflash_flash = sub.add_parser(
+        "dflash-flash", help="Flash and verify both internal DFlash banks"
+    )
+    p_dflash_flash.add_argument("--in", dest="input", required=True,
+                               help="Raw 32KB internal DFlash image")
+    p_dflash_flash.add_argument(
+        "--driver-bin", required=True,
+        help="DQ250 1.5MB binary providing the matching DRIVER block",
+    )
+    p_dflash_flash.add_argument(
+        "--backup-out", help="Save the current DFlash before erasing"
+    )
+    p_dflash_flash.add_argument("--can", default="can0")
+    p_dflash_flash.add_argument("--relay-gpio", type=int)
+    p_dflash_flash.add_argument("--power-off-time", type=float, default=2.0)
+    p_dflash_flash.add_argument(
         "-y", "--yes", action="store_true",
         help="Skip the destructive-operation confirmation",
     )
-    p_eeprom_flash.add_argument("-v", "--verbose", action="store_true")
+    p_dflash_flash.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
 
@@ -2784,9 +3112,24 @@ Examples:
             can_interface=args.can,
             relay_gpio=args.relay_gpio,
             power_off_time=args.power_off_time,
+            size=args.size,
         )
     elif args.command == "eeprom-flash":
         run_eeprom_flash(
+            input_path=args.input,
+            can_interface=args.can,
+            relay_gpio=args.relay_gpio,
+            power_off_time=args.power_off_time,
+        )
+    elif args.command == "dflash-dump":
+        run_dflash_dump(
+            out_path=args.out,
+            can_interface=args.can,
+            relay_gpio=args.relay_gpio,
+            power_off_time=args.power_off_time,
+        )
+    elif args.command == "dflash-flash":
+        run_dflash_flash(
             input_path=args.input,
             driver_bin_path=args.driver_bin,
             can_interface=args.can,

@@ -5,7 +5,8 @@ control units (TCUs) over CAN.
 
 The tool holds the TCU in SBOOT, authenticates through a weak RSA-1024
 verification implementation, uploads a small TriCore Flash Manager, and then
-reads or programs PFlash and DFlash directly.
+reads or programs PFlash and internal DFlash directly. It can also read the
+DQ250's external serial EEPROM through the TC1766 SSC0/SPI peripheral.
 
 Credits: [bri3d](https://github.com/bri3d) for the exploit and research hints.
 
@@ -125,25 +126,31 @@ python3 dq250_bench_flash.py dump \
 
 ### Dump EEPROM
 
+This reads the external 8 KB SPI EEPROM used by the DQ250 application:
+
 ```bash
 python3 dq250_bench_flash.py eeprom-dump \
   --out eeprom.bin \
   --relay-gpio 17
 ```
 
-### Flash EEPROM
+The command refuses to save a dump containing only `0x00` or only `0xFF`.
+Use `--size 0xC00` to read only the area mirrored by the application instead
+of the default full 8 KB image.
+
+External EEPROM writing is temporarily disabled until the new SPI read path
+has been validated on hardware. This prevents the old implementation from
+mistaking internal DFlash for the external EEPROM.
+
+### Dump internal DFlash
 
 ```bash
-python3 dq250_bench_flash.py eeprom-flash \
-  --in eeprom.bin \
-  --driver-bin 0D9300042M.bin \
-  --backup-out eeprom-before-flash.bin \
+python3 dq250_bench_flash.py dflash-dump \
+  --out internal_dflash.bin \
   --relay-gpio 17
 ```
 
-`eeprom-flash` asks you to type `FLASH` before continuing. Use `--yes` only
-when the command is being run unattended and the input file has already been
-checked.
+Internal DFlash may legitimately contain only zeroes on this TCU.
 
 ## Additional commands
 
@@ -176,17 +183,31 @@ python3 dq250_bench_flash.py eeprom-dump \
 
 Add `-v` or `--verbose` to any command for detailed logging.
 
-## EEPROM / DFlash format
+## EEPROM and internal DFlash
 
-The TC1766 contains two separately erasable 16 KB DFlash banks. EEPROM dumps
-are stored as one raw 32 KB file with bank 0 followed directly by bank 1:
+The DQ250 application stores its non-volatile records in an external SPI
+EEPROM connected to SSC0. The application firmware reads `0xC00` bytes into
+its RAM mirror at startup. Bench tools commonly use an 8 KB raw image, which
+is therefore the default for `eeprom-dump`.
+
+Separately, the TC1766 contains two internal 16 KB DFlash banks.
+`dflash-dump` stores these as one raw 32 KB file with bank 0 followed directly
+by bank 1:
 
 | File offset | Size | TCU address |
 |-------------|------|-------------|
 | `0x0000` | 16 KB | `0xAFE00000` (bank 0) |
 | `0x4000` | 16 KB | `0xAFE10000` (bank 1) |
 
-EEPROM flashing uses the DFlash support in the firmware's DRIVER block:
+Internal DFlash flashing is available explicitly as `dflash-flash`:
+
+```bash
+python3 dq250_bench_flash.py dflash-flash \
+  --in internal_dflash.bin \
+  --driver-bin 0D9300042M.bin \
+  --backup-out dflash-before-flash.bin \
+  --relay-gpio 17
+```
 
 - both 16 KB banks are read before erasing;
 - `--backup-out` saves that pre-flash read;
@@ -237,10 +258,16 @@ SBOOT checks these checksums on every boot.
 
 | Option | Description |
 |--------|-------------|
-| `--in` | Raw 32 KB EEPROM image to flash |
 | `--out` | EEPROM dump output path |
+| `--size` | Bytes to read; default: `0x2000` (8 KB), application mirror: `0xC00` |
+
+### Internal DFlash options
+
+| Option | Description |
+|--------|-------------|
+| `--in` | Raw 32 KB internal DFlash image to flash |
 | `--driver-bin` | Compatible 1.5 MB binary supplying the DRIVER |
-| `--backup-out` | Save the current EEPROM before erasing |
+| `--backup-out` | Save the current DFlash before erasing |
 | `--yes` | Skip the `FLASH` confirmation prompt |
 
 ## How it works
@@ -267,6 +294,7 @@ Manager then communicates through raw eight-byte CAN frames:
 | WRITE_DATA | `0x05` | Stream four data bytes per frame | `0x45` |
 | VERIFY | `0x06` | Return write verification state | `0x46` |
 | FLASH_RESET | `0x07` | Reset the flash state machine | `0x47` |
+| EEPROM_READ | `0x08` | Read external EEPROM through SSC0/SPI | `0x48` + data |
 | RESET | `0xFF` | Set warm-boot state and reset the TCU | none |
 
 After a PFlash operation, the reset command writes the CBOOT warm-boot magic,
