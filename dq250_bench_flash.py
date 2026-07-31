@@ -1539,8 +1539,10 @@ def _build_flash_manager(driver_base: int, param_base: int, buffer_base: int,
     read_done_jeq = len(sc)
     sc += _tc_jeq(4, 0, 0)  # placeholder — jump to end when d4 == 0
 
+    # Read exactly the four bytes returned in this CAN frame.  Do not pre-read
+    # the following word: at the final word of a flash bank that would cross
+    # into an unmapped address and trap before the last response is sent.
     sc += _tc_ld_w(0, 3, 0)   # d0 = *(a3+0) — bytes [3:0]
-    sc += _tc_ld_w(1, 3, 4)   # d1 = *(a3+4) — bytes [7:4]
 
     # Build MODATAL: 0x42 | (seq << 8) | (remaining << 16)
     sc += _tc_mov_u(5, 0x0042)      # d5 = 0x42
